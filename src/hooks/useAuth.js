@@ -14,9 +14,9 @@ export function useAuth(currentUser) {
       canManageOutgoing: role === 'manager',
       canInputIncoming: role === 'manager',
       canApproveIncoming: role === 'admin',
-      canViewBookkeeping: role === 'admin',
-      canViewNotes: role === 'admin',
-      canManageUsers: role === 'admin',
+      canViewBookkeeping: role === 'manager',
+      canViewNotes: role === 'manager',
+      canManageUsers: role === 'manager',
     }),
     [currentUser, role],
   )

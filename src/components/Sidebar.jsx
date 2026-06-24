@@ -17,9 +17,9 @@ const allMenus = [
   { key: 'products', path: '/products', label: 'Data Produk', icon: Boxes, roles: ['admin', 'manager'] },
   { key: 'incoming', path: '/incoming', label: 'Barang Masuk', icon: ArrowDownCircle, roles: ['admin', 'manager'] },
   { key: 'outgoing', path: '/outgoing', label: 'Barang Keluar', icon: ArrowUpCircle, roles: ['admin', 'manager'] },
-  { key: 'notes', path: '/notes', label: 'Catatan', icon: NotebookText, roles: ['admin'] },
-  { key: 'bookkeeping', path: '/bookkeeping', label: 'Pembukuan', icon: ReceiptText, roles: ['admin'] },
-  { key: 'users', path: '/users', label: 'Manajemen Users', icon: Users, roles: ['admin'] },
+  { key: 'notes', path: '/notes', label: 'Catatan', icon: NotebookText, roles: ['manager'] },
+  { key: 'bookkeeping', path: '/bookkeeping', label: 'Pembukuan', icon: ReceiptText, roles: ['manager'] },
+  { key: 'users', path: '/users', label: 'Manajemen Users', icon: Users, roles: ['manager'] },
   { key: 'activity', path: '/activity', label: 'Activity', icon: History, roles: ['admin', 'manager'] },
 ]
 

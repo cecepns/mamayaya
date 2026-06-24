@@ -576,7 +576,7 @@ app.get('/api/auth/me', async (req, res) => {
   res.json({ user: req.user })
 })
 
-app.get('/api/users', requireRole(['admin']), async (req, res) => {
+app.get('/api/users', requireRole(['manager']), async (req, res) => {
   try {
     const { page, limit } = parsePagination(req.query)
     const [countRows] = await pool.execute('SELECT COUNT(*) AS total FROM users')
@@ -606,7 +606,7 @@ app.get('/api/users', requireRole(['admin']), async (req, res) => {
   }
 })
 
-app.post('/api/users', requireRole(['admin']), async (req, res) => {
+app.post('/api/users', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { name, email, password, is_active, role } = req.body
@@ -639,7 +639,7 @@ app.post('/api/users', requireRole(['admin']), async (req, res) => {
   }
 })
 
-app.put('/api/users/:id', requireRole(['admin']), async (req, res) => {
+app.put('/api/users/:id', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { id } = req.params
@@ -695,7 +695,7 @@ app.put('/api/users/:id', requireRole(['admin']), async (req, res) => {
   }
 })
 
-app.delete('/api/users/:id', requireRole(['admin']), async (req, res) => {
+app.delete('/api/users/:id', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { id } = req.params
@@ -1688,7 +1688,7 @@ app.delete('/api/outgoing/:id', requireRole(['manager']), async (req, res) => {
   }
 })
 
-app.get('/api/bookkeeping', requireRole(['admin']), async (req, res) => {
+app.get('/api/bookkeeping', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const monthRange = getMonthDateRange(req.query.month)
@@ -1787,7 +1787,7 @@ app.get('/api/bookkeeping', requireRole(['admin']), async (req, res) => {
   }
 })
 
-app.post('/api/bookkeeping', requireRole(['admin']), async (req, res) => {
+app.post('/api/bookkeeping', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { outgoing_id, selling_price, discount } = req.body
@@ -1827,7 +1827,7 @@ app.post('/api/bookkeeping', requireRole(['admin']), async (req, res) => {
   }
 })
 
-app.post('/api/inventory/recalculate-costs', requireRole(['admin']), async (req, res) => {
+app.post('/api/inventory/recalculate-costs', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     await connection.beginTransaction()
@@ -1870,7 +1870,7 @@ app.get('/api/activity', async (req, res) => {
   }
 })
 
-app.get('/api/notes', requireRole(['admin']), async (_req, res) => {
+app.get('/api/notes', requireRole(['manager']), async (_req, res) => {
   try {
     const [rows] = await pool.execute(
       `
@@ -1899,7 +1899,7 @@ app.get('/api/notes', requireRole(['admin']), async (_req, res) => {
   }
 })
 
-app.post('/api/notes', requireRole(['admin']), async (req, res) => {
+app.post('/api/notes', requireRole(['manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const columns = Array.isArray(req.body.columns) ? req.body.columns : []
@@ -1958,7 +1958,7 @@ app.post('/api/notes', requireRole(['admin']), async (req, res) => {
   }
 })
 
-app.post('/api/notes/reset', requireRole(['admin']), async (_req, res) => {
+app.post('/api/notes/reset', requireRole(['manager']), async (_req, res) => {
   const connection = await pool.getConnection()
   try {
     await connection.beginTransaction()

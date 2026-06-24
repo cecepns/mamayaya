@@ -4,8 +4,10 @@ import { apiService } from '../utils/api'
 import { confirmToast, notifyError, notifySuccess } from '../utils/toast'
 import { formatCurrency, formatNumber } from '../utils/format'
 import StatCard from '../components/StatCard'
+import { useAuth } from '../hooks/useAuth'
 
-export default function DashboardPage() {
+export default function DashboardPage({ currentUser }) {
+  const { canViewBookkeeping } = useAuth(currentUser)
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(true)
   const [recalculating, setRecalculating] = useState(false)
@@ -113,26 +115,28 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <div className="card p-4">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-700">Pembukuan Stok</h3>
-            <p className="mt-1 text-sm text-slate-500">
-              Hitung ulang harga modal barang keluar berdasarkan rata-rata stok (moving average).
-              Jalankan sekali setelah deploy atau jika ada koreksi data transaksi lama.
-            </p>
+      {canViewBookkeeping ? (
+        <div className="card p-4">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-700">Pembukuan Stok</h3>
+              <p className="mt-1 text-sm text-slate-500">
+                Hitung ulang harga modal barang keluar berdasarkan rata-rata stok (moving average).
+                Jalankan sekali setelah deploy atau jika ada koreksi data transaksi lama.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn-secondary inline-flex shrink-0 items-center justify-center gap-2 self-start"
+              onClick={handleRecalculateCosts}
+              disabled={recalculating}
+            >
+              {recalculating ? <Loader2 size={16} className="animate-spin" /> : <Calculator size={16} />}
+              {recalculating ? 'Menghitung...' : 'Hitung Ulang Modal'}
+            </button>
           </div>
-          <button
-            type="button"
-            className="btn-secondary inline-flex shrink-0 items-center justify-center gap-2 self-start"
-            onClick={handleRecalculateCosts}
-            disabled={recalculating}
-          >
-            {recalculating ? <Loader2 size={16} className="animate-spin" /> : <Calculator size={16} />}
-            {recalculating ? 'Menghitung...' : 'Hitung Ulang Modal'}
-          </button>
         </div>
-      </div>
+      ) : null}
     </div>
   )
 }

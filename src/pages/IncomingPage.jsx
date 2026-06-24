@@ -56,7 +56,8 @@ const statusBadge = (status) => {
 }
 
 export default function IncomingPage({ currentUser, products, onChanged }) {
-  const { canInputIncoming, canApproveIncoming } = useAuth(currentUser)
+  const { canInputIncoming, canApproveIncoming, isAdmin } = useAuth(currentUser)
+  const hideFinancial = isAdmin
   const [rows, setRows] = useState([])
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState(canApproveIncoming ? 'pending' : '')
@@ -83,6 +84,14 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
   )
 
   const pendingRows = useMemo(() => rows.filter((row) => row.status === 'pending'), [rows])
+
+  const tableColSpan = hideFinancial
+    ? canApproveIncoming
+      ? 9
+      : 8
+    : canApproveIncoming
+      ? 11
+      : 10
 
   const loadData = async () => {
     try {
@@ -134,17 +143,24 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
         return
       }
 
-      const excelRows = exportRows.map((row) => ({
-        Tanggal: formatDate(row.transaction_date),
-        Status: row.status,
-        'Kode Produk': row.product_code,
-        'Nama Produk': row.product_name,
-        Jumlah: Number(row.quantity || 0),
-        'Harga Beli': Number(row.purchase_price || 0),
-        'Total Beli': Number(row.total_purchase || 0),
-        Referensi: row.reference_no || '-',
-        Catatan: row.notes || '-',
-      }))
+      const excelRows = exportRows.map((row) => {
+        const base = {
+          Tanggal: formatDate(row.transaction_date),
+          Status: row.status,
+          'Kode Produk': row.product_code,
+          'Nama Produk': row.product_name,
+          Jumlah: Number(row.quantity || 0),
+        }
+        if (!hideFinancial) {
+          base['Harga Beli'] = Number(row.purchase_price || 0)
+          base['Total Beli'] = Number(row.total_purchase || 0)
+        }
+        return {
+          ...base,
+          Referensi: row.reference_no || '-',
+          Catatan: row.notes || '-',
+        }
+      })
 
       const worksheet = XLSX.utils.json_to_sheet(excelRows)
       const workbook = XLSX.utils.book_new()
@@ -411,8 +427,12 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
               <th className="px-3 py-2 text-left">Kode</th>
               <th className="px-3 py-2 text-left">Nama Produk</th>
               <th className="px-3 py-2 text-right">Jumlah</th>
-              <th className="px-3 py-2 text-right">Harga Beli</th>
-              <th className="px-3 py-2 text-right">Total Beli</th>
+              {!hideFinancial ? (
+                <>
+                  <th className="px-3 py-2 text-right">Harga Beli</th>
+                  <th className="px-3 py-2 text-right">Total Beli</th>
+                </>
+              ) : null}
               <th className="px-3 py-2 text-left">Referensi</th>
               <th className="px-3 py-2 text-left">Input Oleh</th>
               <th className="px-3 py-2 text-right">Aksi</th>
@@ -421,13 +441,13 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
           <tbody>
             {loading ? (
               <tr>
-                <td className="px-3 py-4 text-center text-slate-500" colSpan={canApproveIncoming ? 11 : 10}>
+                <td className="px-3 py-4 text-center text-slate-500" colSpan={tableColSpan}>
                   Memuat data...
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-4 text-center text-slate-500" colSpan={canApproveIncoming ? 11 : 10}>
+                <td className="px-3 py-4 text-center text-slate-500" colSpan={tableColSpan}>
                   Data barang masuk belum ada.
                 </td>
               </tr>
@@ -452,8 +472,12 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
                   <td className="px-3 py-2 text-right font-medium text-emerald-700">
                     +{formatNumber(row.quantity)}
                   </td>
-                  <td className="px-3 py-2 text-right">{formatCurrency(row.purchase_price)}</td>
-                  <td className="px-3 py-2 text-right font-semibold">{formatCurrency(row.total_purchase)}</td>
+                  {!hideFinancial ? (
+                    <>
+                      <td className="px-3 py-2 text-right">{formatCurrency(row.purchase_price)}</td>
+                      <td className="px-3 py-2 text-right font-semibold">{formatCurrency(row.total_purchase)}</td>
+                    </>
+                  ) : null}
                   <td className="px-3 py-2">{row.reference_no || '-'}</td>
                   <td className="px-3 py-2">{row.created_by_name || '-'}</td>
                   <td className="px-3 py-2">

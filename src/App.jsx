@@ -22,9 +22,9 @@ const routeConfigs = [
   { key: 'products', path: '/products', roles: ['admin', 'manager'] },
   { key: 'incoming', path: '/incoming', roles: ['admin', 'manager'] },
   { key: 'outgoing', path: '/outgoing', roles: ['admin', 'manager'] },
-  { key: 'notes', path: '/notes', roles: ['admin'] },
-  { key: 'bookkeeping', path: '/bookkeeping', roles: ['admin'] },
-  { key: 'users', path: '/users', roles: ['admin'] },
+  { key: 'notes', path: '/notes', roles: ['manager'] },
+  { key: 'bookkeeping', path: '/bookkeeping', roles: ['manager'] },
+  { key: 'users', path: '/users', roles: ['manager'] },
   { key: 'activity', path: '/activity', roles: ['admin', 'manager'] },
 ]
 
@@ -191,7 +191,7 @@ function App() {
             <Route
               path="/notes"
               element={
-                <ProtectedRoute currentUser={currentUser} roles={['admin']}>
+                <ProtectedRoute currentUser={currentUser} roles={['manager']}>
                   <NotesPage />
                 </ProtectedRoute>
               }
@@ -199,7 +199,7 @@ function App() {
             <Route
               path="/bookkeeping"
               element={
-                <ProtectedRoute currentUser={currentUser} roles={['admin']}>
+                <ProtectedRoute currentUser={currentUser} roles={['manager']}>
                   <BookkeepingPage onChanged={loadProducts} />
                 </ProtectedRoute>
               }
@@ -207,7 +207,7 @@ function App() {
             <Route
               path="/users"
               element={
-                <ProtectedRoute currentUser={currentUser} roles={['admin']}>
+                <ProtectedRoute currentUser={currentUser} roles={['manager']}>
                   <UsersPage currentUser={currentUser} />
                 </ProtectedRoute>
               }
