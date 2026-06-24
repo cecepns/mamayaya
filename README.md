@@ -1,4 +1,4 @@
-# Mamaya ID — Stock Management
+# Mamayaya  — Stock Management
 
 Aplikasi manajemen stok dengan 2 role: **Admin** dan **Manager**.
 

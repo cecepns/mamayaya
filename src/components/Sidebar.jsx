@@ -43,7 +43,7 @@ export default function Sidebar({ page, open, setOpen, currentUser }) {
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-primary-600">Stock App</p>
-            <h1 className="text-lg font-bold text-slate-800">Mamaya ID</h1>
+            <h1 className="text-lg font-bold text-slate-800">Mamayaya </h1>
           </div>
           <button className="rounded p-1 hover:bg-slate-100 md:hidden" onClick={() => setOpen(false)}>
             <X size={18} />

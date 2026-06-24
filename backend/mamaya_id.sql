@@ -141,4 +141,19 @@ VALUES (
   '[]'
 );
 
--- Default admin & manager dibuat otomatis oleh server.js saat pertama kali dijalankan
+-- Sample users (password: admin12345 / manager12345)
+INSERT INTO users (name, email, password, role, is_active) VALUES
+(
+  'Admin Mamaya',
+  'admin@mamaya.id',
+  '$2b$10$KYfoWSueZ/bKVnIU1rGEI.OgEvRIag3oZLPF/70VDJHgmYomJGDH6',
+  'admin',
+  1
+),
+(
+  'Manager Mamaya',
+  'manager@mamaya.id',
+  '$2b$10$YMBJibfNvvAfIl6sS8aNXOtCLxS3QFa71OSyAsqtixQHQBEZ7FjVW',
+  'manager',
+  1
+);

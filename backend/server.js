@@ -2042,7 +2042,7 @@ const startServer = async () => {
   await ensureDefaultUsers()
   app.listen(port, () => {
     // eslint-disable-next-line no-console
-    console.log(`Mamaya ID API running on http://localhost:${port}`)
+    console.log(`Mamayaya  API running on http://localhost:${port}`)
   })
 }
 
