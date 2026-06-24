@@ -220,10 +220,10 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
   }
 
   useEffect(() => {
-    if (modalOpen) {
+    if (modalOpen && !hideFinancial) {
       loadCostPreview(form.product_id, form.transaction_date)
     }
-  }, [form.product_id, form.transaction_date, modalOpen])
+  }, [form.product_id, form.transaction_date, modalOpen, hideFinancial])
 
   const submitForm = async (event) => {
     event.preventDefault()
@@ -237,7 +237,11 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
       return
     }
     try {
-      const payload = { ...form, quantity: quantityValue }
+      const payload = {
+        ...form,
+        quantity: quantityValue,
+        selling_price: hideFinancial ? 0 : Number(form.selling_price || 0),
+      }
       if (editing) {
         await apiService.updateOutgoing(editing.id, payload)
         notifySuccess('Data barang keluar berhasil diperbarui')
@@ -537,30 +541,36 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
                 required
               />
             </div>
-            <div>
-              <label className="mb-1 block text-xs text-slate-500">
-                Harga Modal (rata-rata stok saat ini)
-              </label>
-              <input
-                type="text"
-                className="input bg-slate-50"
-                value={
-                  loadingCostPreview ? 'Menghitung...' : formatCurrency(Number(costPreview.average_purchase_price || 0))
-                }
-                readOnly
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs text-slate-500">Harga Jual</label>
-              <input
-                type="number"
-                className="input"
-                min="0"
-                value={form.selling_price}
-                onChange={(event) => setForm({ ...form, selling_price: event.target.value })}
-                required
-              />
-            </div>
+            {!hideFinancial ? (
+              <>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">
+                    Harga Modal (rata-rata stok saat ini)
+                  </label>
+                  <input
+                    type="text"
+                    className="input bg-slate-50"
+                    value={
+                      loadingCostPreview
+                        ? 'Menghitung...'
+                        : formatCurrency(Number(costPreview.average_purchase_price || 0))
+                    }
+                    readOnly
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">Harga Jual</label>
+                  <input
+                    type="number"
+                    className="input"
+                    min="0"
+                    value={form.selling_price}
+                    onChange={(event) => setForm({ ...form, selling_price: event.target.value })}
+                    required
+                  />
+                </div>
+              </>
+            ) : null}
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500">Nomor Referensi / Resi</label>

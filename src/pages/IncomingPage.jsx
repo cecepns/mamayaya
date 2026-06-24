@@ -206,7 +206,11 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
       return
     }
     try {
-      const payload = { ...form, quantity: quantityValue }
+      const payload = {
+        ...form,
+        quantity: quantityValue,
+        purchase_price: hideFinancial ? 0 : Number(form.purchase_price || 0),
+      }
       if (editing) {
         await apiService.updateIncoming(editing.id, payload)
         notifySuccess('Data barang masuk berhasil diperbarui')
@@ -233,7 +237,7 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
       const items = filledRows.map((row) => ({
         product_id: row.product_id,
         quantity: Number(row.quantity),
-        purchase_price: Number(row.purchase_price || 0),
+        purchase_price: hideFinancial ? 0 : Number(row.purchase_price || 0),
         reference_no: row.reference_no,
         notes: row.notes,
         transaction_date: row.transaction_date,
@@ -249,13 +253,18 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
   }
 
   const handleDelete = async (row) => {
-    const accepted = await confirmToast(`Hapus pengajuan barang masuk ${row.product_name}?`, 'Ya, hapus')
+    const confirmMessage =
+      row.status === 'approved'
+        ? `Hapus barang masuk ${row.product_name} yang sudah disetujui? Stok produk akan disesuaikan.`
+        : `Hapus pengajuan barang masuk ${row.product_name}?`
+    const accepted = await confirmToast(confirmMessage, 'Ya, hapus')
     if (!accepted) return
 
     try {
       await apiService.deleteIncoming(row.id)
       notifySuccess('Data barang masuk berhasil dihapus')
       await loadData()
+      onChanged()
     } catch (error) {
       notifyError(error.response?.data?.message || 'Gagal menghapus barang masuk')
     }
@@ -500,7 +509,7 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
                           </button>
                         </>
                       ) : null}
-                      {canEditIncoming && row.status === 'pending' ? (
+                      {canEditIncoming ? (
                         <>
                           <button
                             className="rounded p-1 text-sky-700 hover:bg-sky-50"
@@ -612,26 +621,30 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
                 required
               />
             </div>
-            <div>
-              <label className="mb-1 block text-xs text-slate-500">Harga Beli</label>
-              <input
-                type="number"
-                className="input"
-                min="0"
-                value={form.purchase_price}
-                onChange={(event) => setForm({ ...form, purchase_price: event.target.value })}
-                required
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs text-slate-500">Total Beli</label>
-              <input
-                type="text"
-                className="input bg-slate-50"
-                value={formatCurrency(Number(form.quantity || 0) * Number(form.purchase_price || 0))}
-                readOnly
-              />
-            </div>
+            {!hideFinancial ? (
+              <>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">Harga Beli</label>
+                  <input
+                    type="number"
+                    className="input"
+                    min="0"
+                    value={form.purchase_price}
+                    onChange={(event) => setForm({ ...form, purchase_price: event.target.value })}
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">Total Beli</label>
+                  <input
+                    type="text"
+                    className="input bg-slate-50"
+                    value={formatCurrency(Number(form.quantity || 0) * Number(form.purchase_price || 0))}
+                    readOnly
+                  />
+                </div>
+              </>
+            ) : null}
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500">Nomor Referensi / Resi</label>
@@ -735,22 +748,24 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
                     }
                   />
                 </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">Harga Beli</label>
-                  <input
-                    type="number"
-                    className="input"
-                    min="0"
-                    value={row.purchase_price}
-                    onChange={(event) =>
-                      setBulkRows((prev) =>
-                        prev.map((item, rowIndex) =>
-                          rowIndex === index ? { ...item, purchase_price: event.target.value } : item,
-                        ),
-                      )
-                    }
-                  />
-                </div>
+                {!hideFinancial ? (
+                  <div>
+                    <label className="mb-1 block text-xs text-slate-500">Harga Beli</label>
+                    <input
+                      type="number"
+                      className="input"
+                      min="0"
+                      value={row.purchase_price}
+                      onChange={(event) =>
+                        setBulkRows((prev) =>
+                          prev.map((item, rowIndex) =>
+                            rowIndex === index ? { ...item, purchase_price: event.target.value } : item,
+                          ),
+                        )
+                      }
+                    />
+                  </div>
+                ) : null}
                 <div>
                   <label className="mb-1 block text-xs text-slate-500">Referensi / Resi</label>
                   <input

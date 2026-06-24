@@ -1342,10 +1342,6 @@ app.put('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
     }
 
     const old = oldRows[0]
-    if (old.status !== 'pending') {
-      await connection.rollback()
-      return res.status(400).json({ message: 'Hanya barang masuk pending yang bisa diedit' })
-    }
 
     const product = await getProductById(connection, product_id)
     if (!product) {
@@ -1369,7 +1365,18 @@ app.put('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
       [product_id, Number(quantity), resolvedPurchasePrice, refNorm, notes || null, transaction_date, id],
     )
 
-    await logActivity(connection, 'UPDATE_INCOMING', `Edit barang masuk pending ${product.name}`)
+    if (old.status === 'approved') {
+      const affectedProducts = new Set([Number(old.product_id)])
+      if (Number(old.product_id) !== Number(product_id)) {
+        affectedProducts.add(Number(product_id))
+      }
+      for (const affectedProductId of affectedProducts) {
+        await recalculateStockByProductId(connection, affectedProductId)
+        await recalculateOutgoingPurchasePricesForProduct(connection, affectedProductId)
+      }
+    }
+
+    await logActivity(connection, 'UPDATE_INCOMING', `Edit barang masuk ${product.name}`)
     await connection.commit()
 
     res.json({ message: 'Barang masuk berhasil diperbarui' })
@@ -1405,13 +1412,15 @@ app.delete('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
       return res.status(404).json({ message: 'Data barang masuk tidak ditemukan' })
     }
 
-    if (rows[0].status !== 'pending') {
-      await connection.rollback()
-      return res.status(400).json({ message: 'Hanya barang masuk pending yang bisa dihapus' })
+    const row = rows[0]
+    await connection.execute('DELETE FROM incoming_goods WHERE id = ?', [id])
+
+    if (row.status === 'approved') {
+      await recalculateStockByProductId(connection, row.product_id)
+      await recalculateOutgoingPurchasePricesForProduct(connection, row.product_id)
     }
 
-    await connection.execute('DELETE FROM incoming_goods WHERE id = ?', [id])
-    await logActivity(connection, 'DELETE_INCOMING', `Hapus barang masuk pending ${rows[0].name}`)
+    await logActivity(connection, 'DELETE_INCOMING', `Hapus barang masuk ${row.name}`)
     await connection.commit()
 
     res.json({ message: 'Barang masuk berhasil dihapus' })
