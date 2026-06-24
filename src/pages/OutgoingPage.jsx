@@ -1,0 +1,596 @@
+import { useEffect, useMemo, useState } from 'react'
+import { Plus, Pencil, Trash2, Download } from 'lucide-react'
+import AsyncSelect from 'react-select/async'
+import DatePicker from 'react-datepicker'
+import * as XLSX from 'xlsx'
+import { apiService } from '../utils/api'
+import { useAuth } from '../hooks/useAuth'
+import Modal from '../components/Modal'
+import ApiPagination from '../components/ApiPagination'
+import { confirmToast, notifyError, notifySuccess } from '../utils/toast'
+import {
+  formatCurrency,
+  formatDate,
+  formatNumber,
+  formatCalendarDateInput,
+  formatCalendarMonthInput,
+  getTodayCalendarYMD,
+  parseCalendarDateInput,
+  parseCalendarMonthInput,
+} from '../utils/format'
+
+const initialForm = {
+  product_id: '',
+  quantity: 1,
+  selling_price: 0,
+  reference_no: '',
+  notes: '',
+  transaction_date: getTodayCalendarYMD(),
+}
+
+const buildProductOption = (item) => ({
+  value: item.id,
+  label: `${item.code} - ${item.name}`,
+  stock: Number(item.current_stock || 0),
+  minStock: Number(item.min_stock || 10),
+})
+
+const getStockMeta = (option) => {
+  const stock = Number(option?.stock || 0)
+  const minStock = Math.max(1, Number(option?.minStock || 10))
+
+  if (stock <= 0) {
+    return { text: 'Stok habis', color: '#ef4444' }
+  }
+  if (stock <= minStock) {
+    return { text: `Stok: ${formatNumber(stock)}`, color: '#f59e0b' }
+  }
+  return { text: `Stok: ${formatNumber(stock)}`, color: '#10b981' }
+}
+
+const formatProductOptionLabel = (option) => {
+  const stockMeta = getStockMeta(option)
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span>{option.label}</span>
+      <span style={{ color: stockMeta.color, fontWeight: 600 }}>{stockMeta.text}</span>
+    </div>
+  )
+}
+
+export default function OutgoingPage({ currentUser, products, onChanged }) {
+  const { canManageOutgoing, isAdmin } = useAuth(currentUser)
+  const hideFinancial = isAdmin
+  const [rows, setRows] = useState([])
+  const [search, setSearch] = useState('')
+  const [filterDate, setFilterDate] = useState('')
+  const [filterMonth, setFilterMonth] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [exporting, setExporting] = useState(false)
+  const [page, setPage] = useState(1)
+  const [limit, setLimit] = useState(20)
+  const [totalPages, setTotalPages] = useState(1)
+  const [totalItems, setTotalItems] = useState(0)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [form, setForm] = useState(initialForm)
+  const [selectedProduct, setSelectedProduct] = useState(null)
+  const [costPreview, setCostPreview] = useState({ average_purchase_price: 0 })
+  const [loadingCostPreview, setLoadingCostPreview] = useState(false)
+  const defaultProductOptions = useMemo(
+    () => products.slice(0, 20).map(buildProductOption),
+    [products],
+  )
+
+  const tableColSpan = hideFinancial ? (canManageOutgoing ? 7 : 6) : canManageOutgoing ? 11 : 10
+
+  const loadData = async () => {
+    try {
+      setLoading(true)
+      const { data } = await apiService.getOutgoing({
+        search,
+        page,
+        limit,
+        date: filterDate || undefined,
+        month: filterDate ? undefined : filterMonth || undefined,
+      })
+      setRows(data.data)
+      setTotalPages(data.meta?.total_pages || 1)
+      setTotalItems(data.meta?.total_items || 0)
+      if (data.meta?.page && data.meta.page !== page) {
+        setPage(data.meta.page)
+      }
+    } catch (error) {
+      notifyError(error.response?.data?.message || 'Gagal mengambil data barang keluar')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadData()
+  }, [search, page, limit, filterMonth, filterDate])
+
+  const handleExport = async () => {
+    if (!filterDate && !filterMonth) {
+      notifyError('Pilih tanggal atau bulan terlebih dahulu sebelum export Excel')
+      return
+    }
+    try {
+      setExporting(true)
+      const periodLabel = filterDate || filterMonth
+      const { data } = await apiService.getOutgoing({
+        export: 1,
+        date: filterDate || undefined,
+        month: filterDate ? undefined : filterMonth || undefined,
+      })
+
+      const exportRows = data.data || []
+      const filteredRows = exportRows.filter((row) => {
+        const transactionDate = row.transaction_date?.slice(0, 10)
+        if (filterDate) {
+          return transactionDate === filterDate
+        }
+        if (filterMonth) {
+          return transactionDate?.startsWith(`${filterMonth}-`)
+        }
+        return true
+      })
+      if (!filteredRows.length) {
+        notifyError(`Tidak ada data barang keluar pada periode ${periodLabel}`)
+        return
+      }
+
+      const excelRows = filteredRows.map((row) => ({
+        Tanggal: formatDate(row.transaction_date),
+        'Kode Produk': row.product_code,
+        'Nama Produk': row.product_name,
+        Jumlah: Number(row.quantity || 0),
+        'Harga Modal': Number(row.purchase_price || 0),
+        'Harga Jual': Number(row.selling_price || 0),
+        'Total Modal': Number(row.total_purchase || 0),
+        'Total Jual': Number(row.total_selling || 0),
+        Referensi: row.reference_no || '-',
+        Catatan: row.notes || '-',
+      }))
+
+      const worksheet = XLSX.utils.json_to_sheet(excelRows)
+      worksheet['!cols'] = [
+        { wch: 14 },
+        { wch: 16 },
+        { wch: 28 },
+        { wch: 10 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 20 },
+        { wch: 26 },
+      ]
+
+      const workbook = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Barang Keluar')
+      XLSX.writeFile(workbook, `barang-keluar-${periodLabel}.xlsx`)
+      notifySuccess(`Export Excel barang keluar ${periodLabel} berhasil`)
+    } catch (error) {
+      notifyError(error.response?.data?.message || 'Gagal export Excel barang keluar')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const resetForm = () => {
+    setEditing(null)
+    setForm(initialForm)
+    setSelectedProduct(null)
+    setCostPreview({ average_purchase_price: 0 })
+    setModalOpen(false)
+  }
+
+  const loadProductOptions = async (inputValue) => {
+    try {
+      const { data } = await apiService.getProducts({
+        search: inputValue || '',
+        page: 1,
+        limit: 20,
+      })
+      return (data.data || []).map(buildProductOption)
+    } catch {
+      return []
+    }
+  }
+
+  const loadCostPreview = async (productId, transactionDate) => {
+    if (!productId) {
+      setCostPreview({ average_purchase_price: 0 })
+      return
+    }
+    try {
+      setLoadingCostPreview(true)
+      const { data } = await apiService.getProductCost(productId, {
+        transaction_date: transactionDate || undefined,
+      })
+      setCostPreview(data)
+    } catch (error) {
+      notifyError(error.response?.data?.message || 'Gagal mengambil ringkasan harga modal')
+      setCostPreview({ average_purchase_price: 0 })
+    } finally {
+      setLoadingCostPreview(false)
+    }
+  }
+
+  useEffect(() => {
+    if (modalOpen) {
+      loadCostPreview(form.product_id, form.transaction_date)
+    }
+  }, [form.product_id, form.transaction_date, modalOpen])
+
+  const submitForm = async (event) => {
+    event.preventDefault()
+    if (!form.product_id) {
+      notifyError('Produk wajib dipilih')
+      return
+    }
+    const quantityValue = Number(form.quantity)
+    if (!Number.isFinite(quantityValue) || quantityValue <= 0) {
+      notifyError('Jumlah harus lebih dari 0')
+      return
+    }
+    try {
+      const payload = { ...form, quantity: quantityValue }
+      if (editing) {
+        await apiService.updateOutgoing(editing.id, payload)
+        notifySuccess('Data barang keluar berhasil diperbarui')
+      } else {
+        await apiService.createOutgoing(payload)
+        notifySuccess('Barang keluar berhasil ditambahkan')
+      }
+      resetForm()
+      await loadData()
+      onChanged()
+    } catch (error) {
+      notifyError(error.response?.data?.message || 'Gagal menyimpan barang keluar')
+    }
+  }
+
+  const handleDelete = async (row) => {
+    const accepted = await confirmToast(`Hapus transaksi barang keluar ${row.product_name}?`, 'Ya, hapus')
+    if (!accepted) return
+
+    try {
+      await apiService.deleteOutgoing(row.id)
+      notifySuccess('Data barang keluar berhasil dihapus')
+      await loadData()
+      onChanged()
+    } catch (error) {
+      notifyError(error.response?.data?.message || 'Gagal menghapus barang keluar')
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="card p-4">
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <input
+              className="input sm:w-80"
+              placeholder="Cari transaksi..."
+              value={search}
+              onChange={(event) => {
+                setSearch(event.target.value)
+                setPage(1)
+              }}
+            />
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={handleExport}
+                disabled={exporting}
+              >
+                <Download size={16} />
+                {exporting ? 'Export...' : 'Export Excel'}
+              </button>
+              {canManageOutgoing ? (
+                <button
+                  className="btn-primary"
+                  onClick={() => {
+                    setEditing(null)
+                    setForm(initialForm)
+                    setSelectedProduct(null)
+                    setCostPreview({ average_purchase_price: 0 })
+                    setModalOpen(true)
+                  }}
+                >
+                  <Plus size={16} />
+                  Tambah Barang Keluar
+                </button>
+              ) : null}
+            </div>
+          </div>
+          <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-3">
+            <DatePicker
+              selected={parseCalendarDateInput(filterDate)}
+              onChange={(value) => {
+                setFilterDate(formatCalendarDateInput(value))
+                if (value) setFilterMonth('')
+                setPage(1)
+              }}
+              dateFormat="yyyy-MM-dd"
+              placeholderText="Pilih tanggal (harian)"
+              isClearable
+              className="input"
+              wrapperClassName="w-full"
+              portalId="root"
+              popperPlacement="bottom-start"
+              popperClassName="z-[70]"
+            />
+            <DatePicker
+              selected={parseCalendarMonthInput(filterMonth)}
+              onChange={(value) => {
+                setFilterMonth(formatCalendarMonthInput(value))
+                if (value) setFilterDate('')
+                setPage(1)
+              }}
+              dateFormat="MM/yyyy"
+              placeholderText="Pilih bulan"
+              showMonthYearPicker
+              isClearable
+              className="input"
+              wrapperClassName="w-full"
+              portalId="root"
+              popperPlacement="bottom-start"
+              popperClassName="z-[70]"
+            />
+            <button
+              type="button"
+              className="btn-secondary self-start"
+              onClick={() => {
+                setFilterDate('')
+                setFilterMonth('')
+                setPage(1)
+              }}
+            >
+              Reset Bulan
+            </button>
+          </div>
+          <p className="text-xs text-slate-500">
+            Pilih tanggal untuk export harian, atau pilih bulan untuk export bulanan.
+          </p>
+        </div>
+      </div>
+
+      <div className="card overflow-x-auto">
+        <table className="min-w-full text-sm">
+          <thead className="bg-amber-700 text-white">
+            <tr>
+              <th className="px-3 py-2 text-left">Tanggal</th>
+              <th className="px-3 py-2 text-left">Kode</th>
+              <th className="px-3 py-2 text-left">Nama Produk</th>
+              <th className="px-3 py-2 text-right">Jumlah</th>
+              {!hideFinancial ? (
+                <>
+                  <th className="px-3 py-2 text-right">Harga Modal</th>
+                  <th className="px-3 py-2 text-right">Harga Jual</th>
+                  <th className="px-3 py-2 text-right">Total Modal</th>
+                  <th className="px-3 py-2 text-right">Total Jual</th>
+                </>
+              ) : null}
+              <th className="px-3 py-2 text-left">Referensi</th>
+              <th className="px-3 py-2 text-left">Catatan</th>
+              {canManageOutgoing ? <th className="px-3 py-2 text-right">Aksi</th> : null}
+            </tr>
+          </thead>
+          <tbody>
+            {loading ? (
+              <tr>
+                <td className="px-3 py-4 text-center text-slate-500" colSpan={tableColSpan}>
+                  Memuat data...
+                </td>
+              </tr>
+            ) : rows.length === 0 ? (
+              <tr>
+                <td className="px-3 py-4 text-center text-slate-500" colSpan={tableColSpan}>
+                  Data barang keluar belum ada.
+                </td>
+              </tr>
+            ) : (
+              rows.map((row) => (
+                <tr key={row.id} className="border-t border-slate-100">
+                  <td className="px-3 py-2">{formatDate(row.transaction_date)}</td>
+                  <td className="px-3 py-2">{row.product_code}</td>
+                  <td className="px-3 py-2">{row.product_name}</td>
+                  <td className="px-3 py-2 text-right font-medium text-amber-700">
+                    -{formatNumber(row.quantity)}
+                  </td>
+                  {!hideFinancial ? (
+                    <>
+                      <td className="px-3 py-2 text-right">{formatCurrency(row.purchase_price)}</td>
+                      <td className="px-3 py-2 text-right">{formatCurrency(row.selling_price)}</td>
+                      <td className="px-3 py-2 text-right">{formatCurrency(row.total_purchase)}</td>
+                      <td className="px-3 py-2 text-right font-semibold">{formatCurrency(row.total_selling)}</td>
+                    </>
+                  ) : null}
+                  <td className="px-3 py-2">{row.reference_no || '-'}</td>
+                  <td className="px-3 py-2">{row.notes || '-'}</td>
+                  {canManageOutgoing ? (
+                    <td className="px-3 py-2">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          className="rounded p-1 text-sky-700 hover:bg-sky-50"
+                          onClick={() => {
+                            setEditing(row)
+                            const matchedProduct = products.find((item) => Number(item.id) === Number(row.product_id))
+                            setForm({
+                              product_id: row.product_id,
+                              quantity: row.quantity,
+                              selling_price: Number(row.selling_price || 0),
+                              reference_no: row.reference_no || '',
+                              notes: row.notes || '',
+                              transaction_date: row.transaction_date?.slice(0, 10),
+                            })
+                            setSelectedProduct(
+                              matchedProduct
+                                ? buildProductOption(matchedProduct)
+                                : {
+                                    value: row.product_id,
+                                    label: `${row.product_code} - ${row.product_name}`,
+                                    stock: 0,
+                                    minStock: 10,
+                                  },
+                            )
+                            setModalOpen(true)
+                          }}
+                        >
+                          <Pencil size={16} />
+                        </button>
+                        <button
+                          className="rounded p-1 text-rose-700 hover:bg-rose-50"
+                          onClick={() => handleDelete(row)}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    </td>
+                  ) : null}
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+        <ApiPagination
+          page={page}
+          totalPages={totalPages}
+          totalItems={totalItems}
+          limit={limit}
+          loading={loading}
+          onPageChange={(nextPage) => setPage(nextPage)}
+          onLimitChange={(nextLimit) => {
+            setLimit(nextLimit)
+            setPage(1)
+          }}
+        />
+      </div>
+
+      <Modal
+        title={editing ? 'Edit Barang Keluar' : 'Tambah Barang Keluar'}
+        isOpen={modalOpen}
+        onClose={resetForm}
+      >
+        <form className="space-y-3" onSubmit={submitForm}>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500">Produk</label>
+            <AsyncSelect
+              cacheOptions
+              defaultOptions={defaultProductOptions}
+              loadOptions={loadProductOptions}
+              placeholder="Cari produk..."
+              value={selectedProduct}
+              onChange={(option) => {
+                setSelectedProduct(option || null)
+                setForm({ ...form, product_id: option?.value || '' })
+              }}
+              formatOptionLabel={formatProductOptionLabel}
+              isOptionDisabled={(option) => {
+                const stock = Number(option?.stock ?? 0)
+                if (editing && option && Number(option.value) === Number(form.product_id)) {
+                  return false
+                }
+                return stock <= 0
+              }}
+              noOptionsMessage={() => 'Produk tidak ditemukan'}
+            />
+            {selectedProduct ? (
+              <p className="mt-1 text-xs text-slate-500">Stok saat ini: {formatNumber(selectedProduct.stock)}</p>
+            ) : null}
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label className="mb-1 block text-xs text-slate-500">Tanggal</label>
+              <DatePicker
+                selected={parseCalendarDateInput(form.transaction_date)}
+                onChange={(value) =>
+                  setForm({ ...form, transaction_date: formatCalendarDateInput(value) })
+                }
+                dateFormat="yyyy-MM-dd"
+                className="input"
+                wrapperClassName="w-full"
+                portalId="root"
+                popperPlacement="bottom-start"
+                popperClassName="z-[70]"
+                required
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-slate-500">Jumlah</label>
+              <input
+                type="number"
+                className="input"
+                min="1"
+                value={form.quantity}
+                onChange={(event) =>
+                  setForm({
+                    ...form,
+                    quantity: event.target.value === '' ? '' : Number(event.target.value),
+                  })
+                }
+                required
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-slate-500">
+                Harga Modal (rata-rata stok saat ini)
+              </label>
+              <input
+                type="text"
+                className="input bg-slate-50"
+                value={
+                  loadingCostPreview ? 'Menghitung...' : formatCurrency(Number(costPreview.average_purchase_price || 0))
+                }
+                readOnly
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-slate-500">Harga Jual</label>
+              <input
+                type="number"
+                className="input"
+                min="0"
+                value={form.selling_price}
+                onChange={(event) => setForm({ ...form, selling_price: event.target.value })}
+                required
+              />
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500">Nomor Referensi / Resi</label>
+            <input
+              className="input"
+              value={form.reference_no}
+              onChange={(event) => setForm({ ...form, reference_no: event.target.value })}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              Jika diisi, nomor harus unik (tidak boleh sama dengan barang masuk atau barang keluar lain).
+            </p>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500">Catatan</label>
+            <textarea
+              className="input min-h-20"
+              value={form.notes}
+              onChange={(event) => setForm({ ...form, notes: event.target.value })}
+            />
+          </div>
+          <div className="flex justify-end gap-2">
+            <button type="button" className="btn-secondary" onClick={resetForm}>
+              Batal
+            </button>
+            <button className="btn-primary" type="submit">
+              Simpan
+            </button>
+          </div>
+        </form>
+      </Modal>
+    </div>
+  )
+}

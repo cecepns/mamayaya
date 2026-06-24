@@ -1,0 +1,2053 @@
+/* eslint-env node */
+const express = require('express')
+const cors = require('cors')
+const mysql = require('mysql2/promise')
+const bcrypt = require('bcryptjs')
+const jwt = require('jsonwebtoken')
+require('dotenv').config()
+
+const app = express()
+const port = Number(process.env.PORT || 5000)
+const jwtSecret = process.env.JWT_SECRET || 'mamaya-id-secret'
+
+app.use(cors())
+app.use(express.json())
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mamaya_id_db',
+  waitForConnections: true,
+  connectionLimit: 10,
+  // Keep DATE/DATETIME as strings to avoid timezone shift (-1 day) in JSON serialization.
+  dateStrings: true,
+})
+
+const PAGINATION_LIMITS = [10, 20, 50, 100]
+const DEFAULT_PAGE_LIMIT = 20
+
+const parsePagination = (query) => {
+  const requestedPage = Number(query.page)
+  const requestedLimit = Number(query.limit)
+
+  return {
+    page: Number.isFinite(requestedPage) && requestedPage > 0 ? Math.floor(requestedPage) : 1,
+    limit: PAGINATION_LIMITS.includes(requestedLimit) ? requestedLimit : DEFAULT_PAGE_LIMIT,
+  }
+}
+
+const buildPaginationMeta = (requestedPage, limit, totalItems) => {
+  const totalPages = Math.max(1, Math.ceil(totalItems / limit))
+  const page = Math.min(requestedPage, totalPages)
+
+  return {
+    page,
+    limit,
+    total_items: totalItems,
+    total_pages: totalPages,
+    offset: (page - 1) * limit,
+  }
+}
+
+const logActivity = async (connection, action, details) => {
+  await connection.execute('INSERT INTO activity_logs (action, details) VALUES (?, ?)', [action, details])
+}
+
+const recalculateStockByProductId = async (connection, productId) => {
+  const [rows] = await connection.execute(
+    `
+      SELECT
+        p.initial_stock,
+        COALESCE((SELECT SUM(quantity) FROM incoming_goods ig WHERE ig.product_id = p.id AND ig.status = 'approved'), 0) AS incoming_qty,
+        COALESCE((SELECT SUM(quantity) FROM outgoing_goods og WHERE og.product_id = p.id), 0) AS outgoing_qty
+      FROM products p
+      WHERE p.id = ?
+    `,
+    [productId],
+  )
+
+  if (!rows.length) return
+
+  const stock = Number(rows[0].initial_stock) + Number(rows[0].incoming_qty) - Number(rows[0].outgoing_qty)
+  await connection.execute('UPDATE products SET current_stock = ? WHERE id = ?', [stock, productId])
+}
+
+const getProductById = async (connection, productId) => {
+  const [rows] = await connection.execute('SELECT * FROM products WHERE id = ?', [productId])
+  return rows[0]
+}
+
+const hasColumn = async (connection, tableName, columnName) => {
+  const [rows] = await connection.execute(
+    `
+    SELECT COLUMN_NAME
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = ?
+      AND COLUMN_NAME = ?
+    `,
+    [tableName, columnName],
+  )
+  return rows.length > 0
+}
+
+const normalizeDateInput = (value) => {
+  if (!value) return null
+  const s = String(value).trim()
+  if (!s) return null
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s
+  const isoMatch = s.match(/^(\d{4}-\d{2}-\d{2})/)
+  return isoMatch ? isoMatch[1] : null
+}
+
+const normalizeMonthInput = (value) => {
+  if (!value) return null
+  const s = String(value).trim()
+  if (!s) return null
+  if (/^\d{4}-\d{2}$/.test(s)) return s
+  return null
+}
+
+const isTruthyFlag = (value) => {
+  if (value === true || value === 1) return true
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+  return normalized === '1' || normalized === 'true' || normalized === 'yes'
+}
+
+const getMonthDateRange = (monthValue) => {
+  const normalized = normalizeMonthInput(monthValue)
+  if (!normalized) return null
+  const [yearText, monthText] = normalized.split('-')
+  const year = Number(yearText)
+  const month = Number(monthText)
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) return null
+
+  const startDate = `${normalized}-01`
+  const nextYear = month === 12 ? year + 1 : year
+  const nextMonth = month === 12 ? 1 : month + 1
+  const endDateExclusive = `${nextYear}-${String(nextMonth).padStart(2, '0')}-01`
+  return { startDate, endDateExclusive }
+}
+
+const roundPurchasePrice = (value) => Math.round(Number(value || 0))
+
+const INVENTORY_EVENT_ORDER = { initial: 0, incoming: 1, outgoing: 2 }
+
+const compareInventoryEvents = (a, b) => {
+  if (a.transaction_date !== b.transaction_date) {
+    return a.transaction_date.localeCompare(b.transaction_date)
+  }
+  const orderA = INVENTORY_EVENT_ORDER[a.type] ?? 9
+  const orderB = INVENTORY_EVENT_ORDER[b.type] ?? 9
+  if (orderA !== orderB) return orderA - orderB
+  return Number(a.id) - Number(b.id)
+}
+
+const applyMovingAverageIncoming = (state, quantity, purchasePrice) => {
+  const inQty = Number(quantity || 0)
+  const inPrice = Number(purchasePrice || 0)
+  if (inQty <= 0) return state
+
+  const nextQty = state.qty + inQty
+  const nextAvg = nextQty > 0 ? (state.qty * state.avgCost + inQty * inPrice) / nextQty : inPrice
+
+  return { qty: nextQty, avgCost: nextAvg }
+}
+
+const applyMovingAverageOutgoing = (state, quantity) => {
+  const outQty = Number(quantity || 0)
+  const costAtSale = roundPurchasePrice(state.avgCost)
+  return {
+    state: {
+      qty: Math.max(0, state.qty - outQty),
+      avgCost: state.avgCost,
+    },
+    costAtSale,
+  }
+}
+
+const loadInventoryEvents = async (connection, productId, product = null) => {
+  const productRow = product || (await getProductById(connection, productId))
+  if (!productRow) return []
+
+  const events = []
+  const initialQty = Number(productRow.initial_stock || 0)
+  if (initialQty > 0) {
+    events.push({
+      type: 'initial',
+      id: 0,
+      product_id: Number(productId),
+      quantity: initialQty,
+      purchase_price: Number(productRow.purchase_price || 0),
+      transaction_date: normalizeDateInput(productRow.created_at) || '1970-01-01',
+    })
+  }
+
+  const [incomingRows] = await connection.execute(
+    `
+    SELECT id, product_id, quantity, purchase_price, transaction_date
+    FROM incoming_goods
+    WHERE product_id = ? AND status = 'approved'
+    `,
+    [productId],
+  )
+
+  for (const row of incomingRows) {
+    events.push({
+      type: 'incoming',
+      id: Number(row.id),
+      product_id: Number(row.product_id),
+      quantity: Number(row.quantity || 0),
+      purchase_price: Number(row.purchase_price || 0),
+      transaction_date: normalizeDateInput(row.transaction_date),
+    })
+  }
+
+  const [outgoingRows] = await connection.execute(
+    `
+    SELECT id, product_id, quantity, transaction_date
+    FROM outgoing_goods
+    WHERE product_id = ?
+    `,
+    [productId],
+  )
+
+  for (const row of outgoingRows) {
+    events.push({
+      type: 'outgoing',
+      id: Number(row.id),
+      product_id: Number(row.product_id),
+      quantity: Number(row.quantity || 0),
+      purchase_price: 0,
+      transaction_date: normalizeDateInput(row.transaction_date),
+    })
+  }
+
+  return events.filter((event) => event.transaction_date).sort(compareInventoryEvents)
+}
+
+const replayMovingAverageForProduct = async (
+  connection,
+  productId,
+  { stopBeforeOutgoingId = null, upToDate = null } = {},
+) => {
+  const product = await getProductById(connection, productId)
+  if (!product) {
+    return { outgoingPrices: new Map(), currentQty: 0, currentAvgCost: 0 }
+  }
+
+  const events = await loadInventoryEvents(connection, productId, product)
+  const validUpToDate = normalizeDateInput(upToDate)
+  let state = { qty: 0, avgCost: Number(product.purchase_price || 0) }
+  const outgoingPrices = new Map()
+
+  for (const event of events) {
+    if (validUpToDate && event.transaction_date > validUpToDate) break
+
+    if (
+      event.type === 'outgoing' &&
+      stopBeforeOutgoingId &&
+      Number(event.id) === Number(stopBeforeOutgoingId)
+    ) {
+      return {
+        outgoingPrices,
+        currentQty: state.qty,
+        currentAvgCost: roundPurchasePrice(state.avgCost),
+      }
+    }
+
+    if (event.type === 'initial' || event.type === 'incoming') {
+      state = applyMovingAverageIncoming(state, event.quantity, event.purchase_price)
+      continue
+    }
+
+    if (event.type === 'outgoing') {
+      const result = applyMovingAverageOutgoing(state, event.quantity)
+      state = result.state
+      outgoingPrices.set(Number(event.id), result.costAtSale)
+    }
+  }
+
+  return {
+    outgoingPrices,
+    currentQty: state.qty,
+    currentAvgCost: roundPurchasePrice(state.avgCost),
+  }
+}
+
+const recalculateOutgoingPurchasePricesForProduct = async (connection, productId) => {
+  const { outgoingPrices } = await replayMovingAverageForProduct(connection, productId)
+  for (const [outgoingId, price] of outgoingPrices.entries()) {
+    await connection.execute('UPDATE outgoing_goods SET purchase_price = ? WHERE id = ?', [price, outgoingId])
+  }
+}
+
+const recalculateOutgoingPurchasePricesForAllProducts = async (connection) => {
+  const [rows] = await connection.execute('SELECT id FROM products')
+  let updatedProducts = 0
+  for (const row of rows) {
+    await recalculateOutgoingPurchasePricesForProduct(connection, row.id)
+    updatedProducts += 1
+  }
+  return updatedProducts
+}
+
+/**
+ * Moving average berbasis sisa stok:
+ * - Keluar: pakai rata-rata stok saat ini (stok berkurang, rata-rata tetap)
+ * - Masuk: rata-rata baru = (sisa × harga lama + masuk × harga baru) ÷ (sisa + masuk)
+ * - Batch yang sudah habis tidak ikut hitungan lagi
+ */
+const resolveProductPurchaseCost = async (connection, productId, upToDate = null, options = {}) => {
+  const product = await getProductById(connection, productId)
+  const fallbackPrice = roundPurchasePrice(product?.purchase_price || 0)
+  const validDate = normalizeDateInput(upToDate)
+  const { stopBeforeOutgoingId = null } = options
+
+  const replay = await replayMovingAverageForProduct(connection, productId, {
+    stopBeforeOutgoingId,
+    upToDate: stopBeforeOutgoingId ? null : validDate,
+  })
+
+  if (replay.currentQty > 0 || replay.currentAvgCost > 0) {
+    return {
+      averagePurchasePrice: replay.currentAvgCost || fallbackPrice,
+      totalQty: replay.currentQty,
+      totalCost: replay.currentAvgCost * replay.currentQty,
+      cost_basis: 'moving_average',
+      transaction_date: validDate,
+      period_start: null,
+      period_end: validDate,
+    }
+  }
+
+  return {
+    averagePurchasePrice: fallbackPrice,
+    totalQty: 0,
+    totalCost: 0,
+    cost_basis: 'product_fallback',
+    transaction_date: validDate,
+  }
+}
+
+const getProductAveragePurchasePrice = async (connection, productId, upToDate = null, options = {}) => {
+  const preview = await resolveProductPurchaseCost(connection, productId, upToDate, options)
+  return preview.averagePurchasePrice
+}
+
+const getProductPurchaseCostPreview = async (connection, productId, upToDate = null, options = {}) =>
+  resolveProductPurchaseCost(connection, productId, upToDate, options)
+
+const normalizeReferenceNo = (referenceNo) => {
+  if (referenceNo == null) return null
+  const s = String(referenceNo).trim()
+  return s.length ? s : null
+}
+
+/** Nomor resi/referensi unik di barang masuk dan barang keluar (abaikan baris yang sedang diedit). */
+const assertReferenceNoUnique = async (connection, normalizedRef, { excludeIncomingId, excludeOutgoingId } = {}) => {
+  if (!normalizedRef) return
+
+  const incParams = [normalizedRef]
+  let incSql = `
+    SELECT id FROM incoming_goods
+    WHERE reference_no IS NOT NULL AND TRIM(reference_no) = ?
+  `
+  if (excludeIncomingId != null) {
+    incSql += ' AND id <> ?'
+    incParams.push(excludeIncomingId)
+  }
+  const [incDup] = await connection.execute(incSql, incParams)
+  if (incDup.length) {
+    const err = new Error('Nomor referensi / resi sudah digunakan')
+    err.statusCode = 400
+    throw err
+  }
+
+  const outParams = [normalizedRef]
+  let outSql = `
+    SELECT id FROM outgoing_goods
+    WHERE reference_no IS NOT NULL AND TRIM(reference_no) = ?
+  `
+  if (excludeOutgoingId != null) {
+    outSql += ' AND id <> ?'
+    outParams.push(excludeOutgoingId)
+  }
+  const [outDup] = await connection.execute(outSql, outParams)
+  if (outDup.length) {
+    const err = new Error('Nomor referensi / resi sudah digunakan')
+    err.statusCode = 400
+    throw err
+  }
+}
+
+const sanitizeUser = (user) => ({
+  id: user.id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+})
+
+const createToken = (user) =>
+  jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+    },
+    jwtSecret,
+    { expiresIn: '1d' },
+  )
+
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || ''
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+    if (!token) {
+      return res.status(401).json({ message: 'Unauthorized, token diperlukan' })
+    }
+
+    const payload = jwt.verify(token, jwtSecret)
+    const [rows] = await pool.execute('SELECT id, name, email, role, is_active FROM users WHERE id = ?', [payload.id])
+    if (!rows.length || !rows[0].is_active) {
+      return res.status(401).json({ message: 'Akun tidak valid atau tidak aktif' })
+    }
+
+    req.user = sanitizeUser(rows[0])
+    next()
+  } catch (error) {
+    return res.status(401).json({ message: 'Token tidak valid atau sudah expired' })
+  }
+}
+
+const requireRole = (roles) => (req, res, next) => {
+  if (!roles.includes(req.user?.role)) {
+    return res.status(403).json({ message: 'Akses ditolak untuk role Anda' })
+  }
+  next()
+}
+
+const ensureDefaultUsers = async () => {
+  const connection = await pool.getConnection()
+  try {
+    const [rows] = await connection.execute('SELECT COUNT(*) AS total FROM users')
+    if (rows[0].total > 0) return
+
+    const adminName = process.env.ADMIN_NAME || 'Admin Mamaya'
+    const adminEmail = process.env.ADMIN_EMAIL || 'admin@mamaya.id'
+    const adminPassword = process.env.ADMIN_PASSWORD || 'admin12345'
+    const managerName = process.env.MANAGER_NAME || 'Manager Mamaya'
+    const managerEmail = process.env.MANAGER_EMAIL || 'manager@mamaya.id'
+    const managerPassword = process.env.MANAGER_PASSWORD || 'manager12345'
+
+    const adminHash = await bcrypt.hash(adminPassword, 10)
+    const managerHash = await bcrypt.hash(managerPassword, 10)
+
+    await connection.execute(
+      'INSERT INTO users (name, email, password, role, is_active) VALUES (?, ?, ?, ?, ?)',
+      [adminName, adminEmail, adminHash, 'admin', 1],
+    )
+    await connection.execute(
+      'INSERT INTO users (name, email, password, role, is_active) VALUES (?, ?, ?, ?, ?)',
+      [managerName, managerEmail, managerHash, 'manager', 1],
+    )
+    // eslint-disable-next-line no-console
+    console.log(`Default users dibuat: ${adminEmail} (admin), ${managerEmail} (manager)`)
+  } finally {
+    connection.release()
+  }
+}
+
+const ensurePurchasePriceColumns = async () => {
+  const connection = await pool.getConnection()
+  try {
+    const hasIncomingPurchasePrice = await hasColumn(connection, 'incoming_goods', 'purchase_price')
+    if (!hasIncomingPurchasePrice) {
+      await connection.execute(
+        `
+        ALTER TABLE incoming_goods
+        ADD COLUMN purchase_price DECIMAL(15,2) NOT NULL DEFAULT 0 AFTER quantity
+        `,
+      )
+    }
+
+    const hasProductsPurchasePrice = await hasColumn(connection, 'products', 'purchase_price')
+    if (!hasProductsPurchasePrice) {
+      await connection.execute(
+        `
+        ALTER TABLE products
+        ADD COLUMN purchase_price DECIMAL(15,2) NOT NULL DEFAULT 0 AFTER current_stock
+        `,
+      )
+    }
+
+    const hasOutgoingPurchasePrice = await hasColumn(connection, 'outgoing_goods', 'purchase_price')
+    if (!hasOutgoingPurchasePrice) {
+      await connection.execute(
+        `
+        ALTER TABLE outgoing_goods
+        ADD COLUMN purchase_price DECIMAL(15,2) NOT NULL DEFAULT 0 AFTER transaction_date
+        `,
+      )
+    }
+  } finally {
+    connection.release()
+  }
+}
+
+const ensureNotesTable = async () => {
+  const connection = await pool.getConnection()
+  try {
+    await connection.execute(
+      `
+      CREATE TABLE IF NOT EXISTS notes_sheets (
+        id BIGINT PRIMARY KEY AUTO_INCREMENT,
+        name VARCHAR(120) NOT NULL DEFAULT 'Catatan Utama',
+        columns_json LONGTEXT NOT NULL,
+        rows_json LONGTEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+      `,
+    )
+
+    const [rows] = await connection.execute('SELECT id FROM notes_sheets LIMIT 1')
+    if (!rows.length) {
+      await connection.execute(
+        `
+        INSERT INTO notes_sheets (name, columns_json, rows_json)
+        VALUES (?, ?, ?)
+        `,
+        ['Catatan Utama', JSON.stringify(['Data', 'Hutang', 'Total', 'Dead']), JSON.stringify([])],
+      )
+    }
+  } finally {
+    connection.release()
+  }
+}
+
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', app: 'awy-kids-corner-api' })
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email dan password wajib diisi' })
+    }
+
+    const [rows] = await pool.execute('SELECT * FROM users WHERE email = ? LIMIT 1', [email])
+    if (!rows.length) {
+      return res.status(401).json({ message: 'Email atau password salah' })
+    }
+
+    const user = rows[0]
+    if (!user.is_active) {
+      return res.status(403).json({ message: 'Akun nonaktif, hubungi admin' })
+    }
+
+    const passwordValid = await bcrypt.compare(password, user.password)
+    if (!passwordValid) {
+      return res.status(401).json({ message: 'Email atau password salah' })
+    }
+
+    const token = createToken(user)
+    res.json({
+      token,
+      user: sanitizeUser(user),
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health' || req.path === '/auth/login') {
+    return next()
+  }
+  return authenticateToken(req, res, next)
+})
+
+app.get('/api/auth/me', async (req, res) => {
+  res.json({ user: req.user })
+})
+
+app.get('/api/users', requireRole(['admin']), async (req, res) => {
+  try {
+    const { page, limit } = parsePagination(req.query)
+    const [countRows] = await pool.execute('SELECT COUNT(*) AS total FROM users')
+    const meta = buildPaginationMeta(page, limit, Number(countRows[0]?.total || 0))
+
+    const [rows] = await pool.execute(
+      `
+      SELECT id, name, email, role, is_active, created_at, updated_at
+      FROM users
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?
+      `,
+      [meta.limit, meta.offset],
+    )
+
+    res.json({
+      data: rows,
+      meta: {
+        page: meta.page,
+        limit: meta.limit,
+        total_items: meta.total_items,
+        total_pages: meta.total_pages,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+app.post('/api/users', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { name, email, password, is_active, role } = req.body
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Nama, email, dan password wajib diisi' })
+    }
+    const userRole = role === 'admin' ? 'admin' : 'manager'
+
+    await connection.beginTransaction()
+    const [existing] = await connection.execute('SELECT id FROM users WHERE email = ?', [email])
+    if (existing.length) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Email sudah digunakan' })
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10)
+    const [insert] = await connection.execute(
+      'INSERT INTO users (name, email, password, role, is_active) VALUES (?, ?, ?, ?, ?)',
+      [name, email, hashedPassword, userRole, is_active ? 1 : 0],
+    )
+    await logActivity(connection, 'CREATE_USER', `User ${userRole} baru dibuat: ${email}`)
+    await connection.commit()
+
+    res.status(201).json({ id: insert.insertId, message: 'User berhasil dibuat' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.put('/api/users/:id', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    const { name, email, password, is_active, role } = req.body
+    if (!name || !email) {
+      return res.status(400).json({ message: 'Nama dan email wajib diisi' })
+    }
+    const userRole = role === 'admin' ? 'admin' : 'manager'
+
+    await connection.beginTransaction()
+    const [rows] = await connection.execute('SELECT * FROM users WHERE id = ?', [id])
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'User tidak ditemukan' })
+    }
+
+    const [emailConflict] = await connection.execute('SELECT id FROM users WHERE email = ? AND id <> ?', [email, id])
+    if (emailConflict.length) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Email sudah dipakai user lain' })
+    }
+
+    if (password) {
+      const hashedPassword = await bcrypt.hash(password, 10)
+      await connection.execute(
+        `
+          UPDATE users
+          SET name = ?, email = ?, password = ?, is_active = ?, role = ?
+          WHERE id = ?
+        `,
+        [name, email, hashedPassword, is_active ? 1 : 0, userRole, id],
+      )
+    } else {
+      await connection.execute(
+        `
+          UPDATE users
+          SET name = ?, email = ?, is_active = ?, role = ?
+          WHERE id = ?
+        `,
+        [name, email, is_active ? 1 : 0, userRole, id],
+      )
+    }
+
+    await logActivity(connection, 'UPDATE_USER', `User diperbarui: ${email}`)
+    await connection.commit()
+
+    res.json({ message: 'User berhasil diperbarui' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.delete('/api/users/:id', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute('SELECT id, email FROM users WHERE id = ?', [id])
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'User tidak ditemukan' })
+    }
+
+    if (Number(req.user.id) === Number(id)) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Tidak bisa menghapus akun yang sedang login' })
+    }
+
+    await connection.execute('DELETE FROM users WHERE id = ?', [id])
+    await logActivity(connection, 'DELETE_USER', `User dihapus: ${rows[0].email}`)
+    await connection.commit()
+
+    res.json({ message: 'User berhasil dihapus' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/products', async (req, res) => {
+  try {
+    const search = (req.query.search || '').trim()
+    const { page, limit } = parsePagination(req.query)
+    const params = []
+    let where = ''
+
+    if (search) {
+      where = 'WHERE code LIKE ? OR name LIKE ? OR category LIKE ?'
+      const searchValue = `%${search}%`
+      params.push(searchValue, searchValue, searchValue)
+    }
+
+    const [countRows] = await pool.execute(`SELECT COUNT(*) AS total FROM products ${where}`, params)
+    const meta = buildPaginationMeta(page, limit, Number(countRows[0]?.total || 0))
+    const [rows] = await pool.execute(
+      `
+      SELECT *
+      FROM products
+      ${where}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ? OFFSET ?
+      `,
+      [...params, meta.limit, meta.offset],
+    )
+
+    res.json({
+      data: rows,
+      meta: {
+        page: meta.page,
+        limit: meta.limit,
+        total_items: meta.total_items,
+        total_pages: meta.total_pages,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+app.post('/api/products', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const {
+      code,
+      name,
+      unit,
+      min_stock,
+      initial_stock,
+      category,
+    } = req.body
+
+    if (!code || !name) {
+      return res.status(400).json({ message: 'Kode dan nama produk wajib diisi' })
+    }
+
+    await connection.beginTransaction()
+
+    const [existing] = await connection.execute('SELECT id FROM products WHERE code = ?', [code])
+    if (existing.length) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Kode produk sudah digunakan' })
+    }
+
+    const [insert] = await connection.execute(
+      `
+        INSERT INTO products
+        (code, name, unit, min_stock, initial_stock, current_stock, purchase_price, selling_price, category)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        code,
+        name,
+        unit || 'buah',
+        Number(min_stock || 0),
+        Number(initial_stock || 0),
+        Number(initial_stock || 0),
+        0,
+        0,
+        category || null,
+      ],
+    )
+
+    await logActivity(connection, 'CREATE_PRODUCT', `Menambahkan produk ${name} (${code})`)
+    await connection.commit()
+
+    res.status(201).json({ id: insert.insertId, message: 'Produk berhasil dibuat' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.put('/api/products/:id', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    const {
+      code,
+      name,
+      unit,
+      min_stock,
+      initial_stock,
+      category,
+    } = req.body
+
+    await connection.beginTransaction()
+
+    const [exists] = await connection.execute('SELECT id FROM products WHERE id = ?', [id])
+    if (!exists.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+
+    const [duplicate] = await connection.execute('SELECT id FROM products WHERE code = ? AND id <> ?', [code, id])
+    if (duplicate.length) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Kode produk sudah digunakan produk lain' })
+    }
+
+    await connection.execute(
+      `
+        UPDATE products
+        SET code = ?, name = ?, unit = ?, min_stock = ?, initial_stock = ?,
+            purchase_price = ?, selling_price = ?, category = ?
+        WHERE id = ?
+      `,
+      [
+        code,
+        name,
+        unit || 'buah',
+        Number(min_stock || 0),
+        Number(initial_stock || 0),
+        0,
+        0,
+        category || null,
+        id,
+      ],
+    )
+
+    await recalculateStockByProductId(connection, id)
+    await logActivity(connection, 'UPDATE_PRODUCT', `Memperbarui produk ${name} (${code})`)
+    await connection.commit()
+
+    res.json({ message: 'Produk berhasil diperbarui' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.delete('/api/products/:id', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute('SELECT name, code FROM products WHERE id = ?', [id])
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+
+    const [incoming] = await connection.execute('SELECT COUNT(*) AS total FROM incoming_goods WHERE product_id = ?', [id])
+    const [outgoing] = await connection.execute('SELECT COUNT(*) AS total FROM outgoing_goods WHERE product_id = ?', [id])
+
+    if (incoming[0].total > 0 || outgoing[0].total > 0) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Produk sudah dipakai transaksi dan tidak bisa dihapus' })
+    }
+
+    await connection.execute('DELETE FROM products WHERE id = ?', [id])
+    await logActivity(connection, 'DELETE_PRODUCT', `Menghapus produk ${rows[0].name} (${rows[0].code})`)
+    await connection.commit()
+
+    res.json({ message: 'Produk berhasil dihapus' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/products/bulk', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const products = Array.isArray(req.body.products) ? req.body.products : []
+    if (!products.length) {
+      return res.status(400).json({ message: 'Data bulk insert kosong' })
+    }
+
+    await connection.beginTransaction()
+
+    let inserted = 0
+    let skipped = 0
+    for (const item of products) {
+      if (!item.code || !item.name) {
+        skipped += 1
+        continue
+      }
+      const [exists] = await connection.execute('SELECT id FROM products WHERE code = ?', [item.code])
+      if (exists.length) {
+        skipped += 1
+        continue
+      }
+      await connection.execute(
+        `
+          INSERT INTO products
+          (code, name, unit, min_stock, initial_stock, current_stock, purchase_price, selling_price, category)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          item.code,
+          item.name,
+          item.unit || 'buah',
+          Number(item.min_stock || 0),
+          Number(item.initial_stock || 0),
+          Number(item.initial_stock || 0),
+          0,
+          0,
+          item.category || null,
+        ],
+      )
+      inserted += 1
+    }
+
+    await logActivity(connection, 'BULK_INSERT_PRODUCT', `Bulk insert produk: ${inserted} sukses, ${skipped} dilewati`)
+    await connection.commit()
+
+    res.status(201).json({ inserted, skipped, message: 'Bulk insert selesai' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/products/:id/cost', async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    const transactionDate = normalizeDateInput(req.query.transaction_date)
+    const product = await getProductById(connection, id)
+    if (!product) {
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+
+    const preview = await getProductPurchaseCostPreview(connection, id, transactionDate)
+
+    res.json({
+      product_id: Number(id),
+      average_purchase_price: preview.averagePurchasePrice,
+      total_incoming_qty: preview.totalQty,
+      total_incoming_cost: preview.totalCost,
+      transaction_date: preview.transaction_date,
+      cost_basis: preview.cost_basis,
+      period_start: preview.period_start || null,
+      period_end: preview.period_end || null,
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/incoming', async (req, res) => {
+  try {
+    const search = (req.query.search || '').trim()
+    const statusFilter = (req.query.status || '').trim()
+    const exactDate = normalizeDateInput(req.query.date)
+    const monthRange = exactDate ? null : getMonthDateRange(req.query.month)
+    const isExport = isTruthyFlag(req.query.export)
+    const { page, limit } = parsePagination(req.query)
+    const whereClauses = []
+    const params = []
+    if (search) {
+      whereClauses.push('(p.code LIKE ? OR p.name LIKE ? OR ig.reference_no LIKE ?)')
+      const searchValue = `%${search}%`
+      params.push(searchValue, searchValue, searchValue)
+    }
+    if (statusFilter && ['pending', 'approved', 'rejected'].includes(statusFilter)) {
+      whereClauses.push('ig.status = ?')
+      params.push(statusFilter)
+    }
+    if (exactDate) {
+      whereClauses.push('ig.transaction_date = ?')
+      params.push(exactDate)
+    }
+    if (monthRange) {
+      whereClauses.push('(ig.transaction_date >= ? AND ig.transaction_date < ?)')
+      params.push(monthRange.startDate, monthRange.endDateExclusive)
+    }
+    const where = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
+
+    const [countRows] = await pool.execute(
+      `
+      SELECT COUNT(*) AS total
+      FROM incoming_goods ig
+      JOIN products p ON p.id = ig.product_id
+      ${where}
+      `,
+      params,
+    )
+    const totalItems = Number(countRows[0]?.total || 0)
+    const meta = buildPaginationMeta(page, limit, totalItems)
+
+    const baseQuery = `
+      SELECT ig.*, p.code AS product_code, p.name AS product_name,
+        cu.name AS created_by_name, au.name AS approved_by_name
+      FROM incoming_goods ig
+      JOIN products p ON p.id = ig.product_id
+      LEFT JOIN users cu ON cu.id = ig.created_by
+      LEFT JOIN users au ON au.id = ig.approved_by
+      ${where}
+      ORDER BY ig.status ASC, ig.transaction_date DESC, ig.id DESC
+    `
+    const [rows] = isExport
+      ? await pool.execute(baseQuery, params)
+      : await pool.execute(
+          `
+          ${baseQuery}
+          LIMIT ? OFFSET ?
+          `,
+          [...params, meta.limit, meta.offset],
+        )
+    res.json({
+      data: rows.map((row) => ({
+        ...row,
+        total_purchase: Number(row.quantity || 0) * Number(row.purchase_price || 0),
+      })),
+      meta: {
+        page: isExport ? 1 : meta.page,
+        limit: isExport ? rows.length : meta.limit,
+        total_items: totalItems,
+        total_pages: isExport ? 1 : meta.total_pages,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+app.post('/api/incoming', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { product_id, quantity, purchase_price, reference_no, notes, transaction_date } = req.body
+    if (!product_id || Number(quantity) <= 0 || Number(purchase_price) < 0) {
+      return res.status(400).json({ message: 'Produk, quantity, dan harga beli wajib valid' })
+    }
+
+    await connection.beginTransaction()
+    const product = await getProductById(connection, product_id)
+    if (!product) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+
+    const refNorm = normalizeReferenceNo(reference_no)
+    await assertReferenceNoUnique(connection, refNorm, {})
+
+    await connection.execute(
+      `
+      INSERT INTO incoming_goods
+        (product_id, quantity, purchase_price, reference_no, notes, transaction_date, status, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+      `,
+      [
+        product_id,
+        Number(quantity),
+        Number(purchase_price || 0),
+        refNorm,
+        notes || null,
+        transaction_date,
+        req.user.id,
+      ],
+    )
+
+    await logActivity(
+      connection,
+      'CREATE_INCOMING',
+      `Input barang masuk (pending) ${product.name} sebanyak ${quantity}`,
+    )
+    await connection.commit()
+
+    res.status(201).json({ message: 'Barang masuk berhasil diajukan, menunggu persetujuan admin' })
+  } catch (error) {
+    await connection.rollback()
+    if (Number(error.statusCode) === 400) {
+      res.status(400).json({ message: error.message })
+      return
+    }
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/incoming/bulk', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { items } = req.body
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ message: 'Data bulk insert wajib berupa array' })
+    }
+
+    await connection.beginTransaction()
+    let inserted = 0
+
+    for (const item of items) {
+      const { product_id, quantity, purchase_price, reference_no, notes, transaction_date } = item
+      if (!product_id || Number(quantity) <= 0) continue
+
+      const product = await getProductById(connection, product_id)
+      if (!product) continue
+
+      const refNorm = normalizeReferenceNo(reference_no)
+      try {
+        await assertReferenceNoUnique(connection, refNorm, {})
+      } catch {
+        continue
+      }
+
+      await connection.execute(
+        `
+        INSERT INTO incoming_goods
+          (product_id, quantity, purchase_price, reference_no, notes, transaction_date, status, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        `,
+        [
+          product_id,
+          Number(quantity),
+          Number(purchase_price || 0),
+          refNorm,
+          notes || null,
+          transaction_date || new Date().toISOString().slice(0, 10),
+          req.user.id,
+        ],
+      )
+      inserted += 1
+    }
+
+    await logActivity(connection, 'BULK_INCOMING', `Bulk input barang masuk pending: ${inserted} item`)
+    await connection.commit()
+
+    res.status(201).json({ message: `${inserted} barang masuk berhasil diajukan`, inserted })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/incoming/:id/approve', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute(
+      `
+      SELECT ig.*, p.name AS product_name
+      FROM incoming_goods ig
+      JOIN products p ON p.id = ig.product_id
+      WHERE ig.id = ?
+      `,
+      [id],
+    )
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Data barang masuk tidak ditemukan' })
+    }
+
+    const row = rows[0]
+    if (row.status !== 'pending') {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Hanya barang masuk pending yang bisa disetujui' })
+    }
+
+    await connection.execute(
+      `
+      UPDATE incoming_goods
+      SET status = 'approved', approved_by = ?, approved_at = NOW()
+      WHERE id = ?
+      `,
+      [req.user.id, id],
+    )
+
+    await recalculateStockByProductId(connection, row.product_id)
+    await recalculateOutgoingPurchasePricesForProduct(connection, row.product_id)
+    await logActivity(
+      connection,
+      'APPROVE_INCOMING',
+      `Setujui barang masuk ${row.product_name} sebanyak ${row.quantity}`,
+    )
+    await connection.commit()
+
+    res.json({ message: 'Barang masuk disetujui dan stok telah diperbarui' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/incoming/bulk-approve', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { ids } = req.body
+    if (!Array.isArray(ids) || !ids.length) {
+      return res.status(400).json({ message: 'IDs wajib diisi' })
+    }
+
+    await connection.beginTransaction()
+    const productIds = new Set()
+    let approved = 0
+
+    for (const rawId of ids) {
+      const id = Number(rawId)
+      const [rows] = await connection.execute(
+        'SELECT * FROM incoming_goods WHERE id = ? AND status = ?',
+        [id, 'pending'],
+      )
+      if (!rows.length) continue
+
+      await connection.execute(
+        `
+        UPDATE incoming_goods
+        SET status = 'approved', approved_by = ?, approved_at = NOW()
+        WHERE id = ?
+        `,
+        [req.user.id, id],
+      )
+      productIds.add(Number(rows[0].product_id))
+      approved += 1
+    }
+
+    for (const productId of productIds) {
+      await recalculateStockByProductId(connection, productId)
+      await recalculateOutgoingPurchasePricesForProduct(connection, productId)
+    }
+
+    await logActivity(connection, 'BULK_APPROVE_INCOMING', `Setujui ${approved} barang masuk`)
+    await connection.commit()
+
+    res.json({ message: `${approved} barang masuk disetujui`, approved })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/incoming/:id/reject', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute('SELECT * FROM incoming_goods WHERE id = ?', [id])
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Data barang masuk tidak ditemukan' })
+    }
+
+    if (rows[0].status !== 'pending') {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Hanya barang masuk pending yang bisa ditolak' })
+    }
+
+    await connection.execute(
+      `
+      UPDATE incoming_goods
+      SET status = 'rejected', approved_by = ?, approved_at = NOW()
+      WHERE id = ?
+      `,
+      [req.user.id, id],
+    )
+
+    await logActivity(connection, 'REJECT_INCOMING', `Tolak barang masuk #${id}`)
+    await connection.commit()
+
+    res.json({ message: 'Barang masuk ditolak' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.put('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    const { product_id, quantity, purchase_price, reference_no, notes, transaction_date } = req.body
+
+    await connection.beginTransaction()
+    const [oldRows] = await connection.execute('SELECT * FROM incoming_goods WHERE id = ?', [id])
+    if (!oldRows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Data barang masuk tidak ditemukan' })
+    }
+
+    const old = oldRows[0]
+    if (old.status !== 'pending') {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Hanya barang masuk pending yang bisa diedit' })
+    }
+
+    const product = await getProductById(connection, product_id)
+    if (!product) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+    if (Number(quantity) <= 0 || Number(purchase_price) < 0) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Quantity dan harga beli wajib valid' })
+    }
+
+    const refNorm = normalizeReferenceNo(reference_no)
+    await assertReferenceNoUnique(connection, refNorm, { excludeIncomingId: Number(id) })
+
+    await connection.execute(
+      `
+      UPDATE incoming_goods
+      SET product_id = ?, quantity = ?, purchase_price = ?, reference_no = ?, notes = ?, transaction_date = ?
+      WHERE id = ?
+      `,
+      [product_id, Number(quantity), Number(purchase_price || 0), refNorm, notes || null, transaction_date, id],
+    )
+
+    await logActivity(connection, 'UPDATE_INCOMING', `Edit barang masuk pending ${product.name}`)
+    await connection.commit()
+
+    res.json({ message: 'Barang masuk berhasil diperbarui' })
+  } catch (error) {
+    await connection.rollback()
+    if (Number(error.statusCode) === 400) {
+      res.status(400).json({ message: error.message })
+      return
+    }
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.delete('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute(
+      `
+      SELECT ig.id, ig.status, ig.product_id, p.name
+      FROM incoming_goods ig
+      JOIN products p ON p.id = ig.product_id
+      WHERE ig.id = ?
+      `,
+      [id],
+    )
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Data barang masuk tidak ditemukan' })
+    }
+
+    if (rows[0].status !== 'pending') {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Hanya barang masuk pending yang bisa dihapus' })
+    }
+
+    await connection.execute('DELETE FROM incoming_goods WHERE id = ?', [id])
+    await logActivity(connection, 'DELETE_INCOMING', `Hapus barang masuk pending ${rows[0].name}`)
+    await connection.commit()
+
+    res.json({ message: 'Barang masuk berhasil dihapus' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/outgoing', async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const search = (req.query.search || '').trim()
+    const exactDate = normalizeDateInput(req.query.date)
+    const monthRange = exactDate ? null : getMonthDateRange(req.query.month)
+    const isExport = isTruthyFlag(req.query.export)
+    const { page, limit } = parsePagination(req.query)
+    const whereClauses = []
+    const params = []
+    if (search) {
+      whereClauses.push('(p.code LIKE ? OR p.name LIKE ? OR og.reference_no LIKE ?)')
+      const searchValue = `%${search}%`
+      params.push(searchValue, searchValue, searchValue)
+    }
+    if (exactDate) {
+      whereClauses.push('og.transaction_date = ?')
+      params.push(exactDate)
+    }
+    if (monthRange) {
+      whereClauses.push('(og.transaction_date >= ? AND og.transaction_date < ?)')
+      params.push(monthRange.startDate, monthRange.endDateExclusive)
+    }
+    const where = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
+
+    const [countRows] = await connection.execute(
+      `
+      SELECT COUNT(*) AS total
+      FROM outgoing_goods og
+      JOIN products p ON p.id = og.product_id
+      ${where}
+      `,
+      params,
+    )
+    const totalItems = Number(countRows[0]?.total || 0)
+    const meta = buildPaginationMeta(page, limit, totalItems)
+
+    const baseQuery = `
+      SELECT og.*, p.code AS product_code, p.name AS product_name
+      FROM outgoing_goods og
+      JOIN products p ON p.id = og.product_id
+      ${where}
+      ORDER BY og.transaction_date DESC, og.id DESC
+    `
+    const [rows] = isExport
+      ? await connection.execute(baseQuery, params)
+      : await connection.execute(
+          `
+          ${baseQuery}
+          LIMIT ? OFFSET ?
+          `,
+          [...params, meta.limit, meta.offset],
+        )
+
+    res.json({
+      data: rows.map((row) => {
+        const purchasePrice = Number(row.purchase_price || 0)
+        const qty = Number(row.quantity || 0)
+        return {
+          ...row,
+          purchase_price: purchasePrice,
+          total_purchase: purchasePrice * qty,
+          total_selling: Number(row.selling_price || 0) * qty,
+        }
+      }),
+      meta: {
+        page: isExport ? 1 : meta.page,
+        limit: isExport ? rows.length : meta.limit,
+        total_items: totalItems,
+        total_pages: isExport ? 1 : meta.total_pages,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/outgoing', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { product_id, quantity, selling_price, reference_no, notes, transaction_date } = req.body
+    if (!product_id || Number(quantity) <= 0 || Number(selling_price) < 0) {
+      return res.status(400).json({ message: 'Produk, quantity, dan harga jual wajib valid' })
+    }
+
+    await connection.beginTransaction()
+    const product = await getProductById(connection, product_id)
+    if (!product) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+
+    if (Number(product.current_stock) < Number(quantity)) {
+      await connection.rollback()
+      return res.status(400).json({ message: `Stok ${product.name} tidak cukup` })
+    }
+
+    const averagePurchasePrice = await getProductAveragePurchasePrice(
+      connection,
+      product_id,
+      normalizeDateInput(transaction_date),
+    )
+
+    const refNorm = normalizeReferenceNo(reference_no)
+    await assertReferenceNoUnique(connection, refNorm, {})
+
+    await connection.execute(
+      `
+      INSERT INTO outgoing_goods
+      (product_id, quantity, reference_no, notes, transaction_date, purchase_price, selling_price, discount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        product_id,
+        Number(quantity),
+        refNorm,
+        notes || null,
+        transaction_date,
+        Number(averagePurchasePrice || 0),
+        Number(selling_price || 0),
+        0,
+      ],
+    )
+
+    await recalculateStockByProductId(connection, product_id)
+    await recalculateOutgoingPurchasePricesForProduct(connection, product_id)
+    await logActivity(connection, 'CREATE_OUTGOING', `Barang keluar ${product.name} sebanyak ${quantity}`)
+    await connection.commit()
+
+    res.status(201).json({ message: 'Barang keluar berhasil ditambahkan' })
+  } catch (error) {
+    await connection.rollback()
+    if (Number(error.statusCode) === 400) {
+      res.status(400).json({ message: error.message })
+      return
+    }
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.put('/api/outgoing/:id', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    const { product_id, quantity, selling_price, reference_no, notes, transaction_date } = req.body
+    await connection.beginTransaction()
+
+    const [oldRows] = await connection.execute('SELECT * FROM outgoing_goods WHERE id = ?', [id])
+    if (!oldRows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Data barang keluar tidak ditemukan' })
+    }
+    const old = oldRows[0]
+
+    const product = await getProductById(connection, product_id)
+    if (!product) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Produk tidak ditemukan' })
+    }
+
+    if (Number(old.product_id) === Number(product_id)) {
+      const allowedQty = Number(product.current_stock) + Number(old.quantity)
+      if (allowedQty < Number(quantity)) {
+        await connection.rollback()
+        return res.status(400).json({ message: 'Stok tidak cukup untuk update transaksi ini' })
+      }
+    } else if (Number(product.current_stock) < Number(quantity)) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Stok produk tujuan tidak cukup' })
+    }
+    if (Number(selling_price) < 0 || Number(quantity) <= 0) {
+      await connection.rollback()
+      return res.status(400).json({ message: 'Quantity dan harga jual wajib valid' })
+    }
+
+    const averagePurchasePrice = await getProductAveragePurchasePrice(
+      connection,
+      product_id,
+      normalizeDateInput(transaction_date),
+      { stopBeforeOutgoingId: Number(id) },
+    )
+
+    const refNorm = normalizeReferenceNo(reference_no)
+    await assertReferenceNoUnique(connection, refNorm, { excludeOutgoingId: Number(id) })
+
+    await connection.execute(
+      `
+      UPDATE outgoing_goods
+      SET product_id = ?, quantity = ?, reference_no = ?, notes = ?, transaction_date = ?, purchase_price = ?, selling_price = ?
+      WHERE id = ?
+      `,
+      [
+        product_id,
+        Number(quantity),
+        refNorm,
+        notes || null,
+        transaction_date,
+        Number(averagePurchasePrice || 0),
+        Number(selling_price || 0),
+        id,
+      ],
+    )
+
+    await recalculateStockByProductId(connection, old.product_id)
+    if (Number(old.product_id) !== Number(product_id)) {
+      await recalculateStockByProductId(connection, product_id)
+    }
+    await recalculateOutgoingPurchasePricesForProduct(connection, old.product_id)
+    if (Number(old.product_id) !== Number(product_id)) {
+      await recalculateOutgoingPurchasePricesForProduct(connection, product_id)
+    }
+
+    await logActivity(connection, 'UPDATE_OUTGOING', `Edit barang keluar ${product.name} sebanyak ${quantity}`)
+    await connection.commit()
+
+    res.json({ message: 'Barang keluar berhasil diperbarui' })
+  } catch (error) {
+    await connection.rollback()
+    if (Number(error.statusCode) === 400) {
+      res.status(400).json({ message: error.message })
+      return
+    }
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.delete('/api/outgoing/:id', requireRole(['manager']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { id } = req.params
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute(
+      `
+      SELECT og.id, og.quantity, og.product_id, p.name
+      FROM outgoing_goods og
+      JOIN products p ON p.id = og.product_id
+      WHERE og.id = ?
+      `,
+      [id],
+    )
+
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Data barang keluar tidak ditemukan' })
+    }
+
+    await connection.execute('DELETE FROM outgoing_goods WHERE id = ?', [id])
+    await recalculateStockByProductId(connection, rows[0].product_id)
+    await recalculateOutgoingPurchasePricesForProduct(connection, rows[0].product_id)
+    await logActivity(connection, 'DELETE_OUTGOING', `Hapus barang keluar ${rows[0].name}`)
+    await connection.commit()
+
+    res.json({ message: 'Barang keluar berhasil dihapus' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/bookkeeping', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const monthRange = getMonthDateRange(req.query.month)
+    const { page, limit } = parsePagination(req.query)
+    const whereClauses = []
+    const whereParams = []
+    if (monthRange) {
+      whereClauses.push('(og.transaction_date >= ? AND og.transaction_date < ?)')
+      whereParams.push(monthRange.startDate, monthRange.endDateExclusive)
+    }
+    const where = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
+
+    const [countRows] = await connection.execute(
+      `
+      SELECT COUNT(*) AS total
+      FROM outgoing_goods og
+      ${where}
+      `,
+      whereParams,
+    )
+    const meta = buildPaginationMeta(page, limit, Number(countRows[0]?.total || 0))
+
+    const [rows] = await connection.execute(
+      `
+      SELECT
+        og.id,
+        og.product_id,
+        og.transaction_date,
+        og.quantity,
+        og.purchase_price,
+        og.selling_price,
+        og.discount,
+        p.code AS product_code,
+        p.name AS product_name
+      FROM outgoing_goods og
+      JOIN products p ON p.id = og.product_id
+      ${where}
+      ORDER BY og.transaction_date DESC, og.id DESC
+      LIMIT ? OFFSET ?
+      `,
+      [...whereParams, meta.limit, meta.offset],
+    )
+
+    const data = rows.map((row) => {
+      const qty = Number(row.quantity || 0)
+      const purchasePrice = Number(row.purchase_price || 0)
+      const sellingPrice = Number(row.selling_price || 0)
+      const margin =
+        sellingPrice > 0 ? (sellingPrice - Number(row.discount || 0) - purchasePrice) * qty : 0
+      return {
+        ...row,
+        selling_price: sellingPrice > 0 ? row.selling_price : 0,
+        purchase_price: purchasePrice,
+        margin,
+      }
+    })
+
+    const [statRows] = await connection.execute(
+      `
+      SELECT og.quantity, og.purchase_price, og.selling_price, og.discount
+      FROM outgoing_goods og
+      ${where}
+      `,
+      whereParams,
+    )
+
+    const allStats = statRows.reduce(
+      (acc, row) => {
+        const qty = Number(row.quantity || 0)
+        const selling = Number(row.selling_price || 0)
+        const discount = Number(row.discount || 0)
+        const purchase = Number(row.purchase_price || 0)
+        acc.total_transactions += 1
+        acc.total_purchase += purchase * qty
+        acc.total_revenue += selling * qty
+        acc.total_margin += selling > 0 ? (selling - discount - purchase) * qty : 0
+        return acc
+      },
+      { total_transactions: 0, total_purchase: 0, total_revenue: 0, total_margin: 0 },
+    )
+
+    res.json({
+      data,
+      stats: allStats,
+      meta: {
+        page: meta.page,
+        limit: meta.limit,
+        total_items: meta.total_items,
+        total_pages: meta.total_pages,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/bookkeeping', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const { outgoing_id, selling_price, discount } = req.body
+    await connection.beginTransaction()
+
+    const [rows] = await connection.execute('SELECT id, product_id, transaction_date FROM outgoing_goods WHERE id = ?', [outgoing_id])
+    if (!rows.length) {
+      await connection.rollback()
+      return res.status(404).json({ message: 'Transaksi keluar tidak ditemukan' })
+    }
+
+    const productId = rows[0].product_id
+    const averagePurchasePrice = await getProductAveragePurchasePrice(
+      connection,
+      productId,
+      rows[0].transaction_date,
+      { stopBeforeOutgoingId: Number(outgoing_id) },
+    )
+
+    await connection.execute(
+      `
+      UPDATE outgoing_goods
+      SET purchase_price = ?, selling_price = ?, discount = ?
+      WHERE id = ?
+      `,
+      [Number(averagePurchasePrice || 0), Number(selling_price || 0), Number(discount || 0), outgoing_id],
+    )
+
+    await logActivity(connection, 'UPDATE_BOOKKEEPING', `Edit pembukuan transaksi keluar #${outgoing_id}`)
+    await connection.commit()
+    res.json({ message: 'Pembukuan berhasil diperbarui' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/inventory/recalculate-costs', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    await connection.beginTransaction()
+    const updatedProducts = await recalculateOutgoingPurchasePricesForAllProducts(connection)
+    await logActivity(connection, 'RECALCULATE_COSTS', `Recalculate harga modal moving average: ${updatedProducts} produk`)
+    await connection.commit()
+    res.json({
+      message: 'Harga modal barang keluar berhasil dihitung ulang',
+      updated_products: updatedProducts,
+    })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/activity', async (req, res) => {
+  try {
+    const { page, limit } = parsePagination(req.query)
+    const [countRows] = await pool.execute('SELECT COUNT(*) AS total FROM activity_logs')
+    const meta = buildPaginationMeta(page, limit, Number(countRows[0]?.total || 0))
+    const [rows] = await pool.execute(
+      'SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT ? OFFSET ?',
+      [meta.limit, meta.offset],
+    )
+
+    res.json({
+      data: rows,
+      meta: {
+        page: meta.page,
+        limit: meta.limit,
+        total_items: meta.total_items,
+        total_pages: meta.total_pages,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+app.get('/api/notes', requireRole(['admin']), async (_req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `
+      SELECT id, name, columns_json, rows_json, updated_at
+      FROM notes_sheets
+      ORDER BY id ASC
+      LIMIT 1
+      `,
+    )
+    if (!rows.length) {
+      return res.status(404).json({ message: 'Sheet catatan tidak ditemukan' })
+    }
+
+    const sheet = rows[0]
+    res.json({
+      data: {
+        id: sheet.id,
+        name: sheet.name,
+        columns: JSON.parse(sheet.columns_json || '[]'),
+        rows: JSON.parse(sheet.rows_json || '[]'),
+        updated_at: sheet.updated_at,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+app.post('/api/notes', requireRole(['admin']), async (req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    const columns = Array.isArray(req.body.columns) ? req.body.columns : []
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : []
+
+    if (!columns.length) {
+      return res.status(400).json({ message: 'Minimal harus ada 1 kolom' })
+    }
+
+    const normalizedColumns = columns
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .slice(0, 30)
+    if (!normalizedColumns.length) {
+      return res.status(400).json({ message: 'Nama kolom tidak boleh kosong' })
+    }
+
+    const normalizedRows = rows.slice(0, 1000).map((row) => {
+      const source = row && typeof row === 'object' ? row : {}
+      const normalizedRow = {}
+      normalizedColumns.forEach((column) => {
+        normalizedRow[column] = String(source[column] ?? '').slice(0, 500)
+      })
+      return normalizedRow
+    })
+
+    await connection.beginTransaction()
+    const [sheetRows] = await connection.execute('SELECT id FROM notes_sheets ORDER BY id ASC LIMIT 1')
+    if (!sheetRows.length) {
+      await connection.execute(
+        `
+        INSERT INTO notes_sheets (name, columns_json, rows_json)
+        VALUES (?, ?, ?)
+        `,
+        ['Catatan Utama', JSON.stringify(normalizedColumns), JSON.stringify(normalizedRows)],
+      )
+    } else {
+      await connection.execute(
+        `
+        UPDATE notes_sheets
+        SET columns_json = ?, rows_json = ?
+        WHERE id = ?
+        `,
+        [JSON.stringify(normalizedColumns), JSON.stringify(normalizedRows), sheetRows[0].id],
+      )
+    }
+
+    await logActivity(connection, 'SAVE_NOTE_SHEET', `Menyimpan sheet catatan (${normalizedRows.length} baris)`)
+    await connection.commit()
+    res.json({ message: 'Catatan berhasil disimpan' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/notes/reset', requireRole(['admin']), async (_req, res) => {
+  const connection = await pool.getConnection()
+  try {
+    await connection.beginTransaction()
+    const defaultColumns = ['Data', 'Hutang', 'Total', 'Dead']
+    const [sheetRows] = await connection.execute('SELECT id FROM notes_sheets ORDER BY id ASC LIMIT 1')
+    if (!sheetRows.length) {
+      await connection.execute(
+        `
+        INSERT INTO notes_sheets (name, columns_json, rows_json)
+        VALUES (?, ?, ?)
+        `,
+        ['Catatan Utama', JSON.stringify(defaultColumns), JSON.stringify([])],
+      )
+    } else {
+      await connection.execute(
+        `
+        UPDATE notes_sheets
+        SET columns_json = ?, rows_json = ?
+        WHERE id = ?
+        `,
+        [JSON.stringify(defaultColumns), JSON.stringify([]), sheetRows[0].id],
+      )
+    }
+
+    await logActivity(connection, 'RESET_NOTE_SHEET', 'Reset sheet catatan')
+    await connection.commit()
+    res.json({ message: 'Catatan berhasil direset' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(500).json({ message: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.get('/api/dashboard', async (_req, res) => {
+  try {
+    const [productStats] = await pool.execute(
+      `
+      SELECT
+        COUNT(*) AS total_products,
+        COALESCE(SUM(current_stock), 0) AS total_stock,
+        COALESCE(SUM(current_stock * purchase_price), 0) AS stock_value,
+        COALESCE(SUM(CASE WHEN current_stock <= min_stock THEN 1 ELSE 0 END), 0) AS low_stock_count
+      FROM products
+      `,
+    )
+    const [incomingStats] = await pool.execute(
+      "SELECT COALESCE(SUM(quantity), 0) AS total_incoming_qty FROM incoming_goods WHERE status = 'approved'",
+    )
+    const [outgoingStats] = await pool.execute('SELECT COALESCE(SUM(quantity), 0) AS total_outgoing_qty FROM outgoing_goods')
+    const [activityStats] = await pool.execute('SELECT COUNT(*) AS total_activities FROM activity_logs')
+    const [lowStockProducts] = await pool.execute(
+      `
+      SELECT id, code, name, current_stock, min_stock
+      FROM products
+      WHERE current_stock <= min_stock
+      ORDER BY current_stock ASC
+      LIMIT 5
+      `,
+    )
+
+    res.json({
+      totalProducts: productStats[0].total_products,
+      totalStock: productStats[0].total_stock,
+      stockValue: productStats[0].stock_value,
+      lowStockCount: productStats[0].low_stock_count,
+      totalIncomingQty: incomingStats[0].total_incoming_qty,
+      totalOutgoingQty: outgoingStats[0].total_outgoing_qty,
+      totalActivities: activityStats[0].total_activities,
+      lowStockProducts,
+    })
+  } catch (error) {
+    res.status(500).json({ message: error.message })
+  }
+})
+
+const startServer = async () => {
+  await ensureNotesTable()
+  await ensurePurchasePriceColumns()
+  await ensureDefaultUsers()
+  app.listen(port, () => {
+    // eslint-disable-next-line no-console
+    console.log(`Mamaya ID API running on http://localhost:${port}`)
+  })
+}
+
+startServer().catch((error) => {
+  // eslint-disable-next-line no-console
+  console.error('Gagal start server:', error)
+  process.exit(1)
+})
