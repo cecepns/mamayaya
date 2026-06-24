@@ -56,7 +56,7 @@ const statusBadge = (status) => {
 }
 
 export default function IncomingPage({ currentUser, products, onChanged }) {
-  const { canInputIncoming, canApproveIncoming, isAdmin } = useAuth(currentUser)
+  const { canInputIncoming, canEditIncoming, canApproveIncoming, isAdmin } = useAuth(currentUser)
   const hideFinancial = isAdmin
   const [rows, setRows] = useState([])
   const [search, setSearch] = useState('')
@@ -500,7 +500,7 @@ export default function IncomingPage({ currentUser, products, onChanged }) {
                           </button>
                         </>
                       ) : null}
-                      {canInputIncoming && row.status === 'pending' ? (
+                      {canEditIncoming && row.status === 'pending' ? (
                         <>
                           <button
                             className="rounded p-1 text-sky-700 hover:bg-sky-50"

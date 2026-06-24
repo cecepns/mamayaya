@@ -59,7 +59,7 @@ const formatProductOptionLabel = (option) => {
 }
 
 export default function OutgoingPage({ currentUser, products, onChanged }) {
-  const { canManageOutgoing, isAdmin } = useAuth(currentUser)
+  const { canCreateOutgoing, canEditOutgoing, isAdmin } = useAuth(currentUser)
   const hideFinancial = isAdmin
   const [rows, setRows] = useState([])
   const [search, setSearch] = useState('')
@@ -82,7 +82,7 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
     [products],
   )
 
-  const tableColSpan = hideFinancial ? (canManageOutgoing ? 7 : 6) : canManageOutgoing ? 11 : 10
+  const tableColSpan = hideFinancial ? (canEditOutgoing ? 7 : 6) : canEditOutgoing ? 11 : 10
 
   const loadData = async () => {
     try {
@@ -291,7 +291,7 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
                 <Download size={16} />
                 {exporting ? 'Export...' : 'Export Excel'}
               </button>
-              {canManageOutgoing ? (
+              {canCreateOutgoing ? (
                 <button
                   className="btn-primary"
                   onClick={() => {
@@ -378,7 +378,7 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
               ) : null}
               <th className="px-3 py-2 text-left">Referensi</th>
               <th className="px-3 py-2 text-left">Catatan</th>
-              {canManageOutgoing ? <th className="px-3 py-2 text-right">Aksi</th> : null}
+              {canEditOutgoing ? <th className="px-3 py-2 text-right">Aksi</th> : null}
             </tr>
           </thead>
           <tbody>
@@ -413,7 +413,7 @@ export default function OutgoingPage({ currentUser, products, onChanged }) {
                   ) : null}
                   <td className="px-3 py-2">{row.reference_no || '-'}</td>
                   <td className="px-3 py-2">{row.notes || '-'}</td>
-                  {canManageOutgoing ? (
+                  {canEditOutgoing ? (
                     <td className="px-3 py-2">
                       <div className="flex justify-end gap-2">
                         <button

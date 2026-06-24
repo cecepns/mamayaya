@@ -1074,11 +1074,12 @@ app.get('/api/incoming', async (req, res) => {
   }
 })
 
-app.post('/api/incoming', requireRole(['manager']), async (req, res) => {
+app.post('/api/incoming', requireRole(['admin', 'manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { product_id, quantity, purchase_price, reference_no, notes, transaction_date } = req.body
-    if (!product_id || Number(quantity) <= 0 || Number(purchase_price) < 0) {
+    const resolvedPurchasePrice = req.user.role === 'admin' ? 0 : Number(purchase_price || 0)
+    if (!product_id || Number(quantity) <= 0 || resolvedPurchasePrice < 0) {
       return res.status(400).json({ message: 'Produk, quantity, dan harga beli wajib valid' })
     }
 
@@ -1101,7 +1102,7 @@ app.post('/api/incoming', requireRole(['manager']), async (req, res) => {
       [
         product_id,
         Number(quantity),
-        Number(purchase_price || 0),
+        resolvedPurchasePrice,
         refNorm,
         notes || null,
         transaction_date,
@@ -1129,7 +1130,7 @@ app.post('/api/incoming', requireRole(['manager']), async (req, res) => {
   }
 })
 
-app.post('/api/incoming/bulk', requireRole(['manager']), async (req, res) => {
+app.post('/api/incoming/bulk', requireRole(['admin', 'manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { items } = req.body
@@ -1143,6 +1144,7 @@ app.post('/api/incoming/bulk', requireRole(['manager']), async (req, res) => {
     for (const item of items) {
       const { product_id, quantity, purchase_price, reference_no, notes, transaction_date } = item
       if (!product_id || Number(quantity) <= 0) continue
+      const resolvedPurchasePrice = req.user.role === 'admin' ? 0 : Number(purchase_price || 0)
 
       const product = await getProductById(connection, product_id)
       if (!product) continue
@@ -1163,7 +1165,7 @@ app.post('/api/incoming/bulk', requireRole(['manager']), async (req, res) => {
         [
           product_id,
           Number(quantity),
-          Number(purchase_price || 0),
+          resolvedPurchasePrice,
           refNorm,
           notes || null,
           transaction_date || new Date().toISOString().slice(0, 10),
@@ -1330,6 +1332,7 @@ app.put('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
   try {
     const { id } = req.params
     const { product_id, quantity, purchase_price, reference_no, notes, transaction_date } = req.body
+    const resolvedPurchasePrice = req.user.role === 'admin' ? 0 : Number(purchase_price || 0)
 
     await connection.beginTransaction()
     const [oldRows] = await connection.execute('SELECT * FROM incoming_goods WHERE id = ?', [id])
@@ -1349,7 +1352,7 @@ app.put('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
       await connection.rollback()
       return res.status(404).json({ message: 'Produk tidak ditemukan' })
     }
-    if (Number(quantity) <= 0 || Number(purchase_price) < 0) {
+    if (Number(quantity) <= 0 || resolvedPurchasePrice < 0) {
       await connection.rollback()
       return res.status(400).json({ message: 'Quantity dan harga beli wajib valid' })
     }
@@ -1363,7 +1366,7 @@ app.put('/api/incoming/:id', requireRole(['manager']), async (req, res) => {
       SET product_id = ?, quantity = ?, purchase_price = ?, reference_no = ?, notes = ?, transaction_date = ?
       WHERE id = ?
       `,
-      [product_id, Number(quantity), Number(purchase_price || 0), refNorm, notes || null, transaction_date, id],
+      [product_id, Number(quantity), resolvedPurchasePrice, refNorm, notes || null, transaction_date, id],
     )
 
     await logActivity(connection, 'UPDATE_INCOMING', `Edit barang masuk pending ${product.name}`)
@@ -1499,7 +1502,7 @@ app.get('/api/outgoing', async (req, res) => {
   }
 })
 
-app.post('/api/outgoing', requireRole(['manager']), async (req, res) => {
+app.post('/api/outgoing', requireRole(['admin', 'manager']), async (req, res) => {
   const connection = await pool.getConnection()
   try {
     const { product_id, quantity, selling_price, reference_no, notes, transaction_date } = req.body
